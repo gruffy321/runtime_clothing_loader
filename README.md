@@ -12,7 +12,13 @@ https://claude.ai/code/artifact/5aa967c7-c6ee-4bdc-ac25-a4987aa173c6
 | Milestone | State |
 | --- | --- |
 | 1. Architecture, .uplugin, Build.cs, vendored parser | Signed off 2026-10-20 |
-| 2. Core types and module stub | Headers approved; .cpp written, first build pending |
+| 2. Core types and module | Signed off 2026-10-20 |
+| 3. FBX / OBJ parser (ufbx) | Signed off 2026-10-20 |
+| 4. Skeleton binder | Verified 2026-10-21: DAZ bodysuit binds to the female body with 0.00 cm bind offset |
+| 5. Mesh builder | Next |
+
+Each verified milestone is tagged (`m1`...`m4`); new work happens on a `milestone-N` branch
+and is merged into `main` only after it builds and passes its editor test.
 
 ## Install
 
