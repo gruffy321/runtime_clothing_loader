@@ -10,9 +10,13 @@
 #include "HAL/PlatformTime.h"
 #include "Async/Async.h"
 #include "Misc/Paths.h"
+#include "RCLSkeletonSnapshot.h"
+#include "RCLSkeletonBinder.h"
+#include "Engine/SkeletalMesh.h"
+#include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.3.0")
+#define RCL_PLUGIN_VERSION TEXT("0.4.0")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -147,6 +151,92 @@ namespace RCLConsole
 			}
 		});
 	}
+
+	/** Default body for RCL.Bind: the female base body (sign-off decision 5). */
+	static const TCHAR* DefaultBodyPath = TEXT("/Game/Characters/Base/Female/FemaleBase_8_MorphTools_2.FemaleBase_8_MorphTools_2");
+
+	void Bind(const TArray<FString>& Args)
+	{
+		// Optional last argument: a body mesh object path (starts with /Game/). Everything before
+		// it is the file path, which may contain spaces.
+		TArray<FString> FileArgs = Args;
+		FString BodyPath = DefaultBodyPath;
+		if (FileArgs.Num() > 1 && FileArgs.Last().StartsWith(TEXT("/Game/")))
+		{
+			BodyPath = FileArgs.Pop();
+			if (!BodyPath.Contains(TEXT(".")))
+			{
+				BodyPath += TEXT(".") + FPaths::GetBaseFilename(BodyPath);
+			}
+		}
+		const FString Path = PathFromArgs(FileArgs);
+		if (Path.IsEmpty())
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("Usage: RCL.Bind <file.fbx|file.obj> [/Game/path/to/BodyMesh]"));
+			return;
+		}
+
+		// Game thread: load the body and copy its skeleton; the worker never touches UObjects.
+		USkeletalMesh* Body = LoadObject<USkeletalMesh>(nullptr, *BodyPath);
+		if (!Body)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Bind: could not load body mesh '%s'."), *BodyPath);
+			return;
+		}
+		const FRCLSkeletonSnapshot Snapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*Body);
+
+		Async<void>(EAsyncExecution::ThreadPool, [Path, Snapshot]()
+		{
+			TUniquePtr<IRCLMeshParser> Parser = IRCLMeshParser::CreateForFile(Path);
+			if (!Parser)
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Bind: unsupported file type: %s"), *Path);
+				return;
+			}
+
+			const FRCLLoadOptions Options;
+			FRCLImportData Data;
+			ERCLFailureReason Reason = ERCLFailureReason::None;
+			FString Error;
+			if (!Parser->Parse(Path, FRCLParseSettings::FromLoadOptions(Options), Data, Reason, Error))
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Bind: parse failed (%s): %s"), FailureName(Reason), *Error);
+				return;
+			}
+
+			const double Start = FPlatformTime::Seconds();
+			FRCLBindResult Result;
+			if (!FRCLSkeletonBinder::Bind(Data, Snapshot, FRCLBindSettings::FromLoadOptions(Options), Result, Reason, Error))
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Bind failed (%s): %s"), FailureName(Reason), *Error);
+				return;
+			}
+			const double Ms = (FPlatformTime::Seconds() - Start) * 1000.0;
+
+			UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Bind %s -> %s (%d bones): %d garment bone(s), %.2f ms"),
+				*FPaths::GetCleanFilename(Path), *Snapshot.SourceName, Snapshot.NumBones(), Result.BoneNames.Num(), Ms);
+			UE_LOG(LogRuntimeClothing, Log, TEXT("  Root: file '%s' %s"), *Result.FileRootName.ToString(),
+				Result.bRootMappedByPosition ? *FString::Printf(TEXT("mapped to '%s' by position"), *Snapshot.BoneNames[0].ToString()) : TEXT("matched by name"));
+			UE_LOG(LogRuntimeClothing, Log, TEXT("  Matched %d bone(s), unknown %d, reparented %d (%d vertices, %.1f%% of weight)%s"),
+				Result.MatchedBones.Num(), Result.UnknownBones.Num(), Result.ReparentedBones.Num(), Result.NumVerticesReparented,
+				Result.UnknownWeightShare * 100.0f, Result.bTransferRecommended ? TEXT(", weight transfer recommended") : TEXT(""));
+			for (const FName& Unknown : Result.UnknownBones)
+			{
+				UE_LOG(LogRuntimeClothing, Log, TEXT("    Unknown bone: %s"), *Unknown.ToString());
+			}
+			UE_LOG(LogRuntimeClothing, Log, TEXT("  Largest bind offset vs body: %.2f cm ('%s'); %d bone(s) over tolerance"),
+				Result.MaxBindOffsetCm, *Result.MaxBindOffsetBone.ToString(), Result.BonesOverBindTolerance.Num());
+			for (int32 MeshIndex = 0; MeshIndex < Result.MeshInfluences.Num(); ++MeshIndex)
+			{
+				UE_LOG(LogRuntimeClothing, Log, TEXT("  Garment '%s': %d influences over %d vertices"), *Data.Meshes[MeshIndex].Name,
+					Result.MeshInfluences[MeshIndex].Num(), FMath::Max(Result.MeshInfluenceStart[MeshIndex].Num() - 1, 0));
+			}
+			for (const FString& Warning : Result.Warnings)
+			{
+				UE_LOG(LogRuntimeClothing, Log, TEXT("  Warning: %s"), *Warning);
+			}
+		});
+	}
 }
 
 void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
@@ -161,6 +251,11 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		TEXT("RCL.Parse"),
 		TEXT("RCL.Parse <file>: parse an FBX or OBJ file with default options and log the result."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Parse),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.Bind"),
+		TEXT("RCL.Bind <file> [/Game/path/to/BodyMesh]: parse a file and bind it to a body's skeleton (default: the female body)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Bind),
 		ECVF_Default));
 }
 
