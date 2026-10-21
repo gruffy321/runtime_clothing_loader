@@ -51,6 +51,8 @@ private:
 	 *   RCL.Bind <file> [body mesh path]  (Milestone 4) parses, snapshots the body's skeleton on
 	 *                       the game thread (default: the female body), binds on a worker and logs
 	 *                       root mapping, matched / unknown bones and the largest bind offset.
+	 *   RCL.Build <file> [body mesh path]  (Milestone 5) as RCL.Bind, then builds render data for
+	 *                       each garment and logs vertices, sections, influences, tangents, bounds.
 	 * Not compiled into Shipping builds.
 	 */
 	void RegisterConsoleCommands();

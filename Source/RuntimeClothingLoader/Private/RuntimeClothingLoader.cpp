@@ -12,11 +12,13 @@
 #include "Misc/Paths.h"
 #include "RCLSkeletonSnapshot.h"
 #include "RCLSkeletonBinder.h"
+#include "RCLMeshBuilder.h"
+#include "GPUSkinVertexFactory.h"
 #include "Engine/SkeletalMesh.h"
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.4.0")
+#define RCL_PLUGIN_VERSION TEXT("0.5.0")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -155,7 +157,11 @@ namespace RCLConsole
 	/** Default body for RCL.Bind: the female base body (sign-off decision 5). */
 	static const TCHAR* DefaultBodyPath = TEXT("/Game/Characters/Base/Female/FemaleBase_8_MorphTools_2.FemaleBase_8_MorphTools_2");
 
-	void Bind(const TArray<FString>& Args)
+	/**
+	 * Shared by RCL.Bind and RCL.Build. Splits "<file> [/Game/BodyMesh]" and, on the game thread,
+	 * loads the body and copies its skeleton so the worker never touches UObjects.
+	 */
+	bool PrepareBodyCommand(const TCHAR* Command, const TArray<FString>& Args, FString& OutPath, FRCLSkeletonSnapshot& OutSnapshot)
 	{
 		// Optional last argument: a body mesh object path (starts with /Game/). Everything before
 		// it is the file path, which may contain spaces.
@@ -169,21 +175,31 @@ namespace RCLConsole
 				BodyPath += TEXT(".") + FPaths::GetBaseFilename(BodyPath);
 			}
 		}
-		const FString Path = PathFromArgs(FileArgs);
-		if (Path.IsEmpty())
+		OutPath = PathFromArgs(FileArgs);
+		if (OutPath.IsEmpty())
 		{
-			UE_LOG(LogRuntimeClothing, Warning, TEXT("Usage: RCL.Bind <file.fbx|file.obj> [/Game/path/to/BodyMesh]"));
-			return;
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("Usage: %s <file.fbx|file.obj> [/Game/path/to/BodyMesh]"), Command);
+			return false;
 		}
 
-		// Game thread: load the body and copy its skeleton; the worker never touches UObjects.
 		USkeletalMesh* Body = LoadObject<USkeletalMesh>(nullptr, *BodyPath);
 		if (!Body)
 		{
-			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Bind: could not load body mesh '%s'."), *BodyPath);
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("%s: could not load body mesh '%s'."), Command, *BodyPath);
+			return false;
+		}
+		OutSnapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*Body);
+		return true;
+	}
+
+	void Bind(const TArray<FString>& Args)
+	{
+		FString Path;
+		FRCLSkeletonSnapshot Snapshot;
+		if (!PrepareBodyCommand(TEXT("RCL.Bind"), Args, Path, Snapshot))
+		{
 			return;
 		}
-		const FRCLSkeletonSnapshot Snapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*Body);
 
 		Async<void>(EAsyncExecution::ThreadPool, [Path, Snapshot]()
 		{
@@ -237,6 +253,88 @@ namespace RCLConsole
 			}
 		});
 	}
+
+	void Build(const TArray<FString>& Args)
+	{
+		FString Path;
+		FRCLSkeletonSnapshot Snapshot;
+		if (!PrepareBodyCommand(TEXT("RCL.Build"), Args, Path, Snapshot))
+		{
+			return;
+		}
+		// GPU skinning bone limit: read on the game thread, as the real loader will (Milestone 7).
+		const int32 MaxGPUSkinBones = FGPUBaseSkinVertexFactory::GetMaxGPUSkinBones();
+
+		Async<void>(EAsyncExecution::ThreadPool, [Path, Snapshot, MaxGPUSkinBones]()
+		{
+			TUniquePtr<IRCLMeshParser> Parser = IRCLMeshParser::CreateForFile(Path);
+			if (!Parser)
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Build: unsupported file type: %s"), *Path);
+				return;
+			}
+
+			const FRCLLoadOptions Options;
+			FRCLImportData Data;
+			ERCLFailureReason Reason = ERCLFailureReason::None;
+			FString Error;
+			if (!Parser->Parse(Path, FRCLParseSettings::FromLoadOptions(Options), Data, Reason, Error))
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Build: parse failed (%s): %s"), FailureName(Reason), *Error);
+				return;
+			}
+
+			FRCLBindResult Bound;
+			if (!FRCLSkeletonBinder::Bind(Data, Snapshot, FRCLBindSettings::FromLoadOptions(Options), Bound, Reason, Error))
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Build: bind failed (%s): %s"), FailureName(Reason), *Error);
+				return;
+			}
+
+			const FRCLBuildSettings Settings = FRCLBuildSettings::FromLoadOptions(Options, MaxGPUSkinBones);
+			UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Build %s -> %s: %d garment(s), %d garment bone(s), max %d influences, max %d bones per section"),
+				*FPaths::GetCleanFilename(Path), *Snapshot.SourceName, Data.Meshes.Num(), Bound.BoneNames.Num(),
+				Settings.MaxBoneInfluences, Settings.MaxBonesPerSection);
+
+			for (int32 MeshIndex = 0; MeshIndex < Data.Meshes.Num(); ++MeshIndex)
+			{
+				const FRCLImportMesh& Mesh = Data.Meshes[MeshIndex];
+				FRCLBuiltMesh Built;
+				if (!FRCLMeshBuilder::Build(Mesh, Bound.MeshInfluences[MeshIndex], Bound.MeshInfluenceStart[MeshIndex],
+					Bound.ParentIndices, Settings, Built, Reason, Error))
+				{
+					UE_LOG(LogRuntimeClothing, Warning, TEXT("  Garment '%s': build failed (%s): %s"), *Mesh.Name, FailureName(Reason), *Error);
+					continue;
+				}
+
+				const FRCLBuildStats& Stats = Built.Stats;
+				UE_LOG(LogRuntimeClothing, Log, TEXT("  Garment '%s': %d -> %d vertices, %d triangles, %d section(s) (%d split for bones), %d material slot(s), %d active bone(s), %d UV set(s)%s, %d-bit indices, %.2f ms, %.1f KB"),
+					*Built.Name, Stats.NumSourceVertices, Stats.NumRenderVertices, Stats.NumTriangles, Stats.NumSections,
+					Stats.NumSectionsSplitForBones, Built.MaterialSlots.Num(), Built.ActiveBoneIndices.Num(), Built.NumTexCoords(),
+					Built.Colors.Num() > 0 ? TEXT(", vertex colours") : TEXT(""), Stats.bUse32BitIndices ? 32 : 16,
+					Stats.BuildTimeMs, Built.GetAllocatedSize() / 1024.0);
+				UE_LOG(LogRuntimeClothing, Log, TEXT("    Influences: max %d used, %d in file; %d vertices trimmed (largest dropped weight %.1f%%), %d unweighted"),
+					Built.MaxBoneInfluences, Stats.MaxInfluencesInFile, Stats.NumVerticesTrimmed, Stats.MaxWeightTrimmed * 100.0f,
+					Stats.NumVerticesUnweighted);
+				UE_LOG(LogRuntimeClothing, Log, TEXT("    Tangents: %s, %d without a usable UV direction"),
+					Stats.bTangentsComputed ? TEXT("computed") : TEXT("from file"), Stats.NumDegenerateTangents);
+				for (int32 SectionIndex = 0; SectionIndex < Built.Sections.Num(); ++SectionIndex)
+				{
+					const FRCLBuiltSection& Section = Built.Sections[SectionIndex];
+					const int32 Material = Built.MaterialSlots[Section.MaterialSlot];
+					UE_LOG(LogRuntimeClothing, Log, TEXT("    Section %d: material '%s', %u triangles, %u vertices, %d bones, up to %d influences"),
+						SectionIndex, Data.Materials.IsValidIndex(Material) ? *Data.Materials[Material].Name.ToString() : TEXT("?"),
+						Section.NumTriangles, Section.NumVertices, Section.BoneMap.Num(), Section.MaxBoneInfluences);
+				}
+				UE_LOG(LogRuntimeClothing, Log, TEXT("    Bounds: origin %s, extent %s, radius %.1f cm"),
+					*Built.Bounds.Origin.ToString(), *Built.Bounds.BoxExtent.ToString(), Built.Bounds.SphereRadius);
+				for (const FString& Warning : Built.Warnings)
+				{
+					UE_LOG(LogRuntimeClothing, Log, TEXT("    Warning: %s"), *Warning);
+				}
+			}
+		});
+	}
 }
 
 void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
@@ -256,6 +354,11 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		TEXT("RCL.Bind"),
 		TEXT("RCL.Bind <file> [/Game/path/to/BodyMesh]: parse a file and bind it to a body's skeleton (default: the female body)."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Bind),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.Build"),
+		TEXT("RCL.Build <file> [/Game/path/to/BodyMesh]: parse, bind and build render data for a file, and log the result (default body: the female body)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Build),
 		ECVF_Default));
 }
 
