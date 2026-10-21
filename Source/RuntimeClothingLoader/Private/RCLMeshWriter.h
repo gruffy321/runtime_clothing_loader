@@ -39,6 +39,7 @@
 #include "RCLSkeletonBinder.h"
 #include "RCLMeshBuilder.h"
 
+class UObject;
 class USkeletalMesh;
 class USkeleton;
 class UMaterialInterface;
