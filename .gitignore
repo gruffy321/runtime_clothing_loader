@@ -1,0 +1,13 @@
+# Unreal build output (regenerated on every build)
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+*.pdb
+*.obj
+# Editor / OS clutter
+.vs/
+*.VC.db
+*.opendb
+Thumbs.db
+.DS_Store
