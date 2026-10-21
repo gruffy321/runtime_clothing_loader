@@ -15,7 +15,7 @@ https://claude.ai/code/artifact/5aa967c7-c6ee-4bdc-ac25-a4987aa173c6
 | 2. Core types and module | Signed off 2026-10-20 |
 | 3. FBX / OBJ parser (ufbx) | Signed off 2026-10-20 |
 | 4. Skeleton binder | Verified 2026-10-21: DAZ bodysuit binds to the female body with 0.00 cm bind offset |
-| 5. Mesh builder | Headers approved 2026-10-21; implementation awaiting editor test (`RCL.Build`) |
+| 5. Mesh builder | Verified 2026-10-21: DAZ bodysuit builds to 8682 vertices, 5 sections, in 1.5 ms (`RCL.Build`) |
 | 6. Resource writer | Next |
 
 Each verified milestone has a frozen `verified/mN` branch; new work happens on a `milestone-N` branch
