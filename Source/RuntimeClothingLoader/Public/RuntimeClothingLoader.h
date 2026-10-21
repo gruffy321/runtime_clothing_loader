@@ -48,6 +48,9 @@ private:
 	 *   RCL.Inspect <file>  lists the file's mesh parts (FRCLMeshNodeInfo) in the log.
 	 *   RCL.Parse <file>    parses with default options and logs counts, bones, materials,
 	 *                       textures, warnings and timings. Runs on a worker thread.
+	 *   RCL.Bind <file> [body mesh path]  (Milestone 4) parses, snapshots the body's skeleton on
+	 *                       the game thread (default: the female body), binds on a worker and logs
+	 *                       root mapping, matched / unknown bones and the largest bind offset.
 	 * Not compiled into Shipping builds.
 	 */
 	void RegisterConsoleCommands();
