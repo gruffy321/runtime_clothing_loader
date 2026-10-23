@@ -27,7 +27,7 @@
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.6.1")
+#define RCL_PLUGIN_VERSION TEXT("0.6.2")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -471,7 +471,8 @@ namespace RCLConsole
 			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.ListBodies: start Play-In-Editor first."));
 			return;
 		}
-		FString BodyPath = Rest.Num() > 0 ? Rest.Last() : FString(DefaultBodyPath);
+		// Only a /Game/ path counts as a body; anything else (a file pasted by mistake) is ignored.
+		FString BodyPath = Rest.Num() > 0 && Rest.Last().StartsWith(TEXT("/Game/")) ? Rest.Last() : FString(DefaultBodyPath);
 		if (!BodyPath.Contains(TEXT(".")))
 		{
 			BodyPath += TEXT(".") + FPaths::GetBaseFilename(BodyPath);
