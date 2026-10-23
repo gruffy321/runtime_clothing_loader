@@ -34,7 +34,7 @@
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.8.1")
+#define RCL_PLUGIN_VERSION TEXT("0.9.0")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -528,14 +528,19 @@ namespace RCLConsole
 		// -actor=Name picks the character whose actor name contains Name (see RCL.ListBodies).
 		FString ActorFilter;
 		bool bHalfPrecisionUVs = false;
-		// -bodyweights: take the weights from the body (follows its jiggle and extra bones) instead of the file's.
-		bool bBodyWeights = false;
+		// Weights and bone orientations come from the body by default (Milestone 8, TD 2026-10-23).
+		// -fileweights keeps the file's own instead, to compare; -bodyweights is accepted and changes nothing.
+		bool bFileWeights = false;
 		TArray<FString> Remaining;
 		for (const FString& Arg : Args)
 		{
-			if (Arg.Equals(TEXT("-bodyweights"), ESearchCase::IgnoreCase))
+			if (Arg.Equals(TEXT("-fileweights"), ESearchCase::IgnoreCase))
 			{
-				bBodyWeights = true;
+				bFileWeights = true;
+			}
+			else if (Arg.Equals(TEXT("-bodyweights"), ESearchCase::IgnoreCase))
+			{
+				// the default now
 			}
 			else
 			{
@@ -574,9 +579,9 @@ namespace RCLConsole
 		FRCLLoadOptions Options;
 		Options.BodyMesh = BodyComponent->SkeletalMesh;   // the body actually worn
 		Options.bUseFullPrecisionUVs = !bHalfPrecisionUVs;
-		if (bBodyWeights)
+		if (bFileWeights)
 		{
-			Options.SkinningMode = ERCLSkinningMode::TransferAlways;
+			Options.SkinningMode = ERCLSkinningMode::FileWeights;
 		}
 		const TWeakObjectPtr<USkeletalMeshComponent> WeakBody(BodyComponent);
 
@@ -747,7 +752,7 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(
 		TEXT("RCL.Spawn"),
-		TEXT("RCL.Spawn <file> [/Game/path/to/BodyMesh] [-actor=Name] [-halfuv] [-bodyweights]: during Play-In-Editor, load a file and put it on the on-screen character wearing that body (default: the female body), following it through master pose."),
+		TEXT("RCL.Spawn <file> [/Game/path/to/BodyMesh] [-actor=Name] [-halfuv] [-fileweights]: during Play-In-Editor, load a file and put it on the on-screen character wearing that body (default: the female body), following it through master pose."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Spawn),
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(

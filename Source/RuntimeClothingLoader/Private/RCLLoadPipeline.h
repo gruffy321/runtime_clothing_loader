@@ -104,8 +104,17 @@ private:
 	/** Worker: parse, bind, build every garment; fills the job's report and built meshes. */
 	static void RunWorker(FJob& Job);
 
-	/** Game thread: write meshes (loads only), fill the cache, answer every live waiter, start the next job. */
+	/** Game thread: frees the worker slot; checks are answered now, successful loads go to the write
+	 *  queue (Milestone 8), failed loads are finished now. */
 	void CompleteOnGameThread(const TSharedRef<FJob, ESPMode::ThreadSafe>& Job);
+
+	/** Game thread, core ticker (Milestone 8): writes queued meshes, oldest load first, within the
+	 *  per-frame budget (console variable rcl.WriteBudgetMs, default 2 ms). Returns false (unregisters)
+	 *  when the queue is empty. */
+	bool TickWrites(float DeltaTime);
+
+	/** Game thread: fill the cache, answer every live waiter, forget the in-flight entry. */
+	void FinishLoad(const TSharedRef<FJob, ESPMode::ThreadSafe>& Job, bool bSucceeded, const TArray<USkeletalMesh*>& Meshes);
 
 	/** Game thread: answer one request (if still active) and forget it. */
 	void AnswerLoad(uint32 RequestId, bool bSucceeded, const TArray<USkeletalMesh*>& Meshes, const FRCLLoadReport& Report);
@@ -130,6 +139,8 @@ private:
 	TMap<FRCLCacheKey, FCacheEntry> Cache;
 	TMap<FRCLCacheKey, TSharedRef<FJob, ESPMode::ThreadSafe>> InFlightLoads;   // merges duplicate loads
 	TArray<TSharedRef<FJob, ESPMode::ThreadSafe>> Queue;
+	TArray<TSharedRef<FJob, ESPMode::ThreadSafe>> WritingJobs;   // worker done, meshes being written over frames
+	FDelegateHandle WriteTickerHandle;
 	int32 RunningJobs = 0;
 	uint32 NextRequestId = 1;
 	bool bShuttingDown = false;

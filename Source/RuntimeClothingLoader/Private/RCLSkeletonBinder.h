@@ -103,8 +103,10 @@ public:
 	 * unknown bones under the Reject policy.
 	 *
 	 * Modes:
-	 *  - Auto: file weights, remapped. Garments with no weights get empty influence arrays
-	 *    (Milestone 8 fills them by transfer).
+	 *  - Auto, FileWeights: file weights, remapped. Garments with no weights get empty influence
+	 *    arrays. The pipeline then replaces every garment's weights and pose with the body's for Auto
+	 *    (Milestone 8, TD 2026-10-23), and only fills the empty ones for FileWeights. Binding the
+	 *    file's weights first is what lets Auto fall back to them if the body cannot be read.
 	 *  - RigidToBone: every vertex 100% on RigidAttachBone; file weights ignored.
 	 *  - TransferAlways: empty influence arrays for every garment.
 	 */
@@ -113,12 +115,14 @@ public:
 
 	/**
 	 * Milestone 8: replaces garment MeshIndex's influences with ones from weight transfer, given as
-	 * TARGET bone indices. Bones the garment skeleton lacks are added (with their ancestors, at the
-	 * target's reference pose; existing bones keep their file bind pose), in target order, and every
-	 * garment's influences are remapped to the new bone indices.
+	 * TARGET bone indices. Bones the garment skeleton lacks are added (with their ancestors), in target
+	 * order, and every garment's influences are remapped to the new bone indices.
+	 * bUseTargetPose true (body weights): EVERY bone takes the target's reference pose, since the
+	 * weights were authored against it. False: existing bones keep their file bind pose.
 	 */
 	static void AddTargetInfluences(int32 MeshIndex, const TArray<FRCLInfluence>& TargetInfluences,
-		const TArray<uint32>& TargetInfluenceStart, const FRCLSkeletonSnapshot& Target, FRCLBindResult& InOutResult);
+		const TArray<uint32>& TargetInfluenceStart, const FRCLSkeletonSnapshot& Target, bool bUseTargetPose,
+		FRCLBindResult& InOutResult);
 
 private:
 	/** File joint -> target bone index (or INDEX_NONE). The file root joint (no parent) maps to

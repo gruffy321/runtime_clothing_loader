@@ -28,16 +28,22 @@ enum class ERCLSourceFormat : uint8
 UENUM(BlueprintType)
 enum class ERCLSkinningMode : uint8
 {
-	/** Keep the file's weights for bones the target skeleton has; transfer weights from the
-	 *  body for game-only bones (jiggle bones) and for files with no usable skin at all. */
+	/** The body's weights AND bind pose for every garment vertex and bone, so clothing follows the
+	 *  base character exactly: its rig, jiggle and extra bones, and physics (TD, 2026-10-23). The
+	 *  file's own rig only tells us where the garment sits. Falls back to the file's weights if the
+	 *  body cannot be read. */
 	Auto,
 
 	/** Every vertex 100% on RigidAttachBone. For hats, glasses, helmets. Matches the game's
 	 *  existing AttachBone / AttachOffset clothing fields. */
 	RigidToBone,
 
-	/** Ignore the file's weights and transfer everything from the body. */
-	TransferAlways
+	/** As Auto, but fail rather than fall back to the file's weights if the body cannot be read. */
+	TransferAlways,
+
+	/** Milestone 8: keep the file's own weights and bind pose (weights come from the body only when the
+	 *  file has none). For items whose rig should not follow the body's, if any. */
+	FileWeights
 };
 
 /** What to do with a file bone the target skeleton does not have (sign-off decision 6). */
@@ -298,7 +304,8 @@ struct RUNTIMECLOTHINGLOADER_API FRCLLoadReport
 	UPROPERTY(BlueprintReadOnly, Category = "Report")
 	float WorkerTimeMs = 0.0f;
 
-	/** Game-thread time (mesh assembly), in ms. Must stay small: the game runs in VR. */
+	/** Game-thread time (mesh assembly), in ms, added up over the frames it was spread across
+	 *  (Milestone 8: at most about rcl.WriteBudgetMs per frame, except the final InitResources call). */
 	UPROPERTY(BlueprintReadOnly, Category = "Report")
 	float GameThreadTimeMs = 0.0f;
 };

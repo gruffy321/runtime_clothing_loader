@@ -167,8 +167,8 @@ void FRCLTransfer::TransferMorphs(const TArray<FRCLVertexMatch>& Matches, const 
 					const int32 Slot = SlotOfBodyVertex[Match.BodyVertex[N]];
 					if (Slot != INDEX_NONE)
 					{
-						Position += BodyMorph.PositionDelta[Slot] * Match.Weight[N];
-						Normal += BodyMorph.NormalDelta[Slot] * Match.Weight[N];
+						Position += BodyMorph.PositionDelta[Slot].ToVector() * Match.Weight[N];
+						Normal += BodyMorph.NormalDelta[Slot].ToVector() * Match.Weight[N];
 					}
 				}
 				if (Position.SizeSquared() > ThresholdSq)

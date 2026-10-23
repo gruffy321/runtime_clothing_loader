@@ -13,6 +13,7 @@
 #include "Rendering/SkeletalMeshLODRenderData.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
+#include "HAL/PlatformTime.h"
 #if WITH_EDITOR
 #include "Rendering/SkeletalMeshLODModel.h"   // FSoftSkinVertex (editor-only type)
 #endif
@@ -270,44 +271,41 @@ void FRCLMeshWriter::FillIndexBufferAndBones(FSkeletalMeshLODRenderData& LOD, co
 	LOD.RequiredBones = Built.RequiredBones;
 }
 
-void FRCLMeshWriter::CreateMorphTargets(USkeletalMesh& Mesh, const FRCLBuiltMesh& Built)
+void FRCLMeshWriter::CreateMorphTarget(USkeletalMesh& Mesh, const FRCLBuiltMesh& Built, FRCLBuiltMorph& Source, bool bMoveDeltas)
 {
-	if (Built.Morphs.Num() == 0)
+	// Named exactly as the body's morph: master pose hands the body's value to it by name.
+	UMorphTarget* Morph = NewObject<UMorphTarget>(&Mesh, Source.Name);
+	Morph->BaseSkelMesh = &Mesh;
+	FMorphTargetLODModel& Model = Morph->MorphLODModels[Morph->MorphLODModels.AddDefaulted()];
+	Model.NumBaseMeshVerts = Built.NumVertices();
+	Model.SectionIndices = Source.SectionIndices;
+	if (bMoveDeltas)
 	{
-		return;
+		Model.Vertices = MoveTemp(Source.Deltas);
 	}
-	for (const FRCLBuiltMorph& Source : Built.Morphs)
+	else
 	{
-		// Named exactly as the body's morph: master pose hands the body's value to it by name.
-		UMorphTarget* Morph = NewObject<UMorphTarget>(&Mesh, Source.Name);
-		Morph->BaseSkelMesh = &Mesh;
-		FMorphTargetLODModel& Model = Morph->MorphLODModels[Morph->MorphLODModels.AddDefaulted()];
-		Model.NumBaseMeshVerts = Built.NumVertices();
-		Model.SectionIndices = Source.SectionIndices;
-		Model.Vertices.SetNumUninitialized(Source.RenderVertex.Num());
-		for (int32 K = 0; K < Source.RenderVertex.Num(); ++K)
-		{
-			FMorphTargetDelta& Delta = Model.Vertices[K];
-			Delta.PositionDelta = Source.PositionDelta[K];
-			Delta.TangentZDelta = Source.TangentZDelta[K];
-			Delta.SourceIdx = Source.RenderVertex[K];
-		}
-		Mesh.MorphTargets.Add(Morph);
+		Model.Vertices = Source.Deltas;
 	}
-	// Builds the name -> index map (and registers the names as curves on the skeleton, which already
-	// has them from the body). Must run before InitResources, which builds the GPU morph buffers.
-	Mesh.InitMorphTargets();
+	Mesh.MorphTargets.Add(Morph);
 }
 
 void FRCLMeshWriter::FinaliseAndInit(USkeletalMesh& Mesh, FSkeletalMeshLODRenderData* LOD, const FRCLBuiltMesh& Built)
 {
+	if (Mesh.MorphTargets.Num() > 0)
+	{
+		// Builds the name -> index map (and registers the names as curves on the skeleton, which already
+		// has them from the body). Must run before InitResources, which builds the GPU morph buffers.
+		Mesh.InitMorphTargets();
+	}
+
 	Mesh.AllocateResourceForRendering();
 	Mesh.GetResourceForRendering()->LODRenderData.Add(LOD);   // the render data now owns the LOD
 
 	Mesh.SetImportedBounds(Built.Bounds);
 
 	// Starts render-thread initialisation of every buffer (index, position, tangent/UV, skin
-	// weights, colours if any, duplicated-vertices per section).
+	// weights, colours if any, duplicated-vertices per section, GPU morph buffers).
 	Mesh.InitResources();
 }
 
@@ -315,47 +313,168 @@ USkeletalMesh* FRCLMeshWriter::Create(const FRCLBuiltMesh& Built, const FRCLBind
 	const FRCLImportData& Data, const FRCLWriteSettings& Settings,
 	ERCLFailureReason& OutReason, FString& OutError)
 {
-	OutReason = ERCLFailureReason::None;
+	// All pieces in one go (console commands and tests). The deltas are copied, so Built is untouched.
+	FRCLMeshWriteTask Task(const_cast<FRCLBuiltMesh&>(Built), Bound, Data, Settings, /*bConsumeMorphs*/ false);
+	while (!Task.Step(TNumericLimits<double>::Max()))
+	{
+	}
+	OutReason = Task.GetFailureReason();
+	OutError = Task.GetError();
+	return Task.TakeResult();
+}
 
+// ---- Milestone 8: writing over several frames ---------------------------------------------------
+
+FRCLMeshWriteTask::FRCLMeshWriteTask(FRCLBuiltMesh& InBuilt, const FRCLBindResult& InBound, const FRCLImportData& InData,
+	const FRCLWriteSettings& InSettings, bool bInConsumeMorphs)
+	: Built(InBuilt)
+	, Bound(InBound)
+	, Data(InData)
+	, Settings(InSettings)
+	, bConsumeMorphs(bInConsumeMorphs)
+{
+}
+
+FRCLMeshWriteTask::~FRCLMeshWriteTask()
+{
+	if (!IsFinished() || Mesh)
+	{
+		Abort();
+	}
+}
+
+bool FRCLMeshWriteTask::Step(double BudgetSeconds)
+{
+	if (IsFinished())
+	{
+		return true;
+	}
+	const double StepStart = FPlatformTime::Seconds();
+	do
+	{
+		const double PieceStart = FPlatformTime::Seconds();
+		const EStage PieceStage = Stage;
+		RunPiece();
+		const double PieceMs = (FPlatformTime::Seconds() - PieceStart) * 1000.0;
+		switch (PieceStage)
+		{
+		case EStage::Setup:  Timings.SetupMs += PieceMs; break;
+		case EStage::Morphs: Timings.MorphsMs += PieceMs; break;
+		case EStage::Init:   Timings.InitMs += PieceMs; break;
+		default: break;
+		}
+		Timings.LongestPieceMs = FMath::Max(Timings.LongestPieceMs, PieceMs);
+	}
+	while (!IsFinished() && FPlatformTime::Seconds() - StepStart < BudgetSeconds);
+	++Timings.NumSteps;
+	return IsFinished();
+}
+
+void FRCLMeshWriteTask::RunPiece()
+{
 	if (!IsInGameThread())
 	{
-		OutReason = ERCLFailureReason::InternalError;
-		OutError = TEXT("The mesh writer must run on the game thread.");
-		return nullptr;
+		Fail(ERCLFailureReason::InternalError, TEXT("The mesh writer must run on the game thread."));
+		return;
 	}
-	if (!Settings.Skeleton)
+
+	switch (Stage)
 	{
-		OutReason = ERCLFailureReason::MissingTargetSkeleton;
-		OutError = TEXT("No target skeleton was given.");
-		return nullptr;
-	}
-	if (Built.NumVertices() == 0 || Built.Indices.Num() == 0 || Built.Sections.Num() == 0 || Bound.BoneNames.Num() == 0)
+	case EStage::Setup:
 	{
-		OutReason = ERCLFailureReason::InternalError;
-		OutError = FString::Printf(TEXT("Garment '%s' has no render data."), *Built.Name);
-		return nullptr;
+		if (!Settings.Skeleton)
+		{
+			Fail(ERCLFailureReason::MissingTargetSkeleton, TEXT("No target skeleton was given."));
+			return;
+		}
+		if (Built.NumVertices() == 0 || Built.Indices.Num() == 0 || Built.Sections.Num() == 0 || Bound.BoneNames.Num() == 0)
+		{
+			Fail(ERCLFailureReason::InternalError, FString::Printf(TEXT("Garment '%s' has no render data."), *Built.Name));
+			return;
+		}
+
+		Mesh = FRCLMeshWriter::CreateMeshObject(Built, Settings);
+		Mesh->AddToRoot();   // until TakeResult: safe from garbage collection between frames
+
+		FString SkeletonError;
+		if (!FRCLMeshWriter::BuildReferenceSkeleton(*Mesh, Bound, Settings, SkeletonError))
+		{
+			Fail(ERCLFailureReason::MissingTargetSkeleton, SkeletonError);
+			return;
+		}
+		FRCLMeshWriter::AssignMaterials(*Mesh, Built, Data, Settings);
+
+		// Plain C++ object, not exported but with an inline constructor; ownership passes to the
+		// mesh's render data in the Init piece.
+		LOD = new FSkeletalMeshLODRenderData();
+		FRCLMeshWriter::FillSections(*LOD, Built);
+		FRCLMeshWriter::FillVertexBuffers(*LOD, Built, Settings);
+		FRCLMeshWriter::FillSkinWeights(*LOD, Built, Settings);
+		FRCLMeshWriter::FillIndexBufferAndBones(*LOD, Built);
+		Stage = Built.Morphs.Num() > 0 ? EStage::Morphs : EStage::Init;
+		return;
 	}
+	case EStage::Morphs:
+		FRCLMeshWriter::CreateMorphTarget(*Mesh, Built, Built.Morphs[NextMorph], bConsumeMorphs);
+		if (++NextMorph >= Built.Morphs.Num())
+		{
+			Stage = EStage::Init;
+		}
+		return;
+	case EStage::Init:
+		FRCLMeshWriter::FinaliseAndInit(*Mesh, LOD, Built);
+		LOD = nullptr;   // owned by the mesh now
+		Stage = EStage::Done;
+		return;
+	default:
+		return;
+	}
+}
 
-	USkeletalMesh* Mesh = CreateMeshObject(Built, Settings);
+void FRCLMeshWriteTask::Fail(ERCLFailureReason Reason, const FString& InError)
+{
+	FailureReason = Reason;
+	Error = InError;
+	Abort();
+	Stage = EStage::Failed;
+}
 
-	if (!BuildReferenceSkeleton(*Mesh, Bound, Settings, OutError))
+USkeletalMesh* FRCLMeshWriteTask::TakeResult()
+{
+	if (Stage != EStage::Done || !Mesh)
 	{
-		OutReason = ERCLFailureReason::MissingTargetSkeleton;
-		Mesh->MarkPendingKill();   // no render data yet, so nothing to release
 		return nullptr;
 	}
+	USkeletalMesh* Result = Mesh;
+	Mesh = nullptr;
+	Result->RemoveFromRoot();
+	return Result;
+}
 
-	AssignMaterials(*Mesh, Built, Data, Settings);
-
-	// Plain C++ object, not exported but with an inline constructor; ownership passes to the
-	// mesh's render data in FinaliseAndInit.
-	FSkeletalMeshLODRenderData* LOD = new FSkeletalMeshLODRenderData();
-	FillSections(*LOD, Built);
-	FillVertexBuffers(*LOD, Built, Settings);
-	FillSkinWeights(*LOD, Built, Settings);
-	FillIndexBufferAndBones(*LOD, Built);
-
-	CreateMorphTargets(*Mesh, Built);
-	FinaliseAndInit(*Mesh, LOD, Built);
-	return Mesh;
+void FRCLMeshWriteTask::Abort()
+{
+	if (LOD)
+	{
+		delete LOD;   // never handed to the mesh, so no render resources were started for it
+		LOD = nullptr;
+	}
+	if (Mesh)
+	{
+		Mesh->RemoveFromRoot();
+		if (Stage != EStage::Done)
+		{
+			// No render resources were started (InitResources is the last piece), so nothing to release.
+			Mesh->MarkPendingKill();
+		}
+		Mesh = nullptr;
+	}
+	if (!IsFinished())
+	{
+		Stage = EStage::Failed;
+		if (FailureReason == ERCLFailureReason::None)
+		{
+			FailureReason = ERCLFailureReason::Cancelled;
+			Error = TEXT("Writing was stopped.");
+		}
+	}
 }

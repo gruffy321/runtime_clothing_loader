@@ -32,8 +32,7 @@ SIZE_T FRCLBuiltMesh::GetAllocatedSize() const
 	Size += Morphs.GetAllocatedSize();
 	for (const FRCLBuiltMorph& Morph : Morphs)
 	{
-		Size += Morph.RenderVertex.GetAllocatedSize() + Morph.PositionDelta.GetAllocatedSize()
-			+ Morph.TangentZDelta.GetAllocatedSize() + Morph.SectionIndices.GetAllocatedSize();
+		Size += Morph.Deltas.GetAllocatedSize() + Morph.SectionIndices.GetAllocatedSize();
 	}
 	return Size;
 }
@@ -775,14 +774,14 @@ void FRCLMeshBuilder::BuildMorphs(const TArray<FRCLMorphDeltas>& SourceMorphs, F
 
 		FRCLBuiltMorph& Morph = InOutMesh.Morphs[InOutMesh.Morphs.AddDefaulted()];
 		Morph.Name = Source.Name;
-		Morph.RenderVertex.Reserve(Entries.Num());
-		Morph.PositionDelta.Reserve(Entries.Num());
-		Morph.TangentZDelta.Reserve(Entries.Num());
-		for (const FEntry& Entry : Entries)
+		Morph.Deltas.SetNumUninitialized(Entries.Num());
+		for (int32 K = 0; K < Entries.Num(); ++K)
 		{
-			Morph.RenderVertex.Add(Entry.Render);
-			Morph.PositionDelta.Add(Entry.Position);
-			Morph.TangentZDelta.Add(Entry.Normal);
+			const FEntry& Entry = Entries[K];
+			FMorphTargetDelta& Delta = Morph.Deltas[K];
+			Delta.PositionDelta = Entry.Position;
+			Delta.TangentZDelta = Entry.Normal;
+			Delta.SourceIdx = Entry.Render;
 			Morph.SectionIndices.AddUnique(SectionOfRender[Entry.Render]);
 		}
 		Morph.SectionIndices.Sort();

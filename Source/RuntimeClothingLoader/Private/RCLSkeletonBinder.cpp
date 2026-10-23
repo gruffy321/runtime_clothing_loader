@@ -379,7 +379,8 @@ bool FRCLSkeletonBinder::Bind(const FRCLImportData& Data, const FRCLSkeletonSnap
 }
 
 void FRCLSkeletonBinder::AddTargetInfluences(int32 MeshIndex, const TArray<FRCLInfluence>& TargetInfluences,
-	const TArray<uint32>& TargetInfluenceStart, const FRCLSkeletonSnapshot& Target, FRCLBindResult& InOutResult)
+	const TArray<uint32>& TargetInfluenceStart, const FRCLSkeletonSnapshot& Target, bool bUseTargetPose,
+	FRCLBindResult& InOutResult)
 {
 	check(InOutResult.MeshInfluences.IsValidIndex(MeshIndex));
 
@@ -424,7 +425,7 @@ void FRCLSkeletonBinder::AddTargetInfluences(int32 MeshIndex, const TArray<FRCLI
 		const int32 TargetParent = Target.ParentIndices[Bone];
 		const int32* GarmentParent = (TargetParent != INDEX_NONE) ? NewGarmentOfTarget.Find(TargetParent) : nullptr;
 		const int32* Old = OldGarmentOfTarget.Find(Bone);
-		const FTransform Component = Old ? InOutResult.RefPoseComponent[*Old] : Target.RefPoseComponent[Bone];
+		const FTransform Component = (Old && !bUseTargetPose) ? InOutResult.RefPoseComponent[*Old] : Target.RefPoseComponent[Bone];
 
 		const int32 GarmentIndex = Rebuilt.BoneNames.Add(Target.BoneNames[Bone]);
 		Rebuilt.ParentIndices.Add(GarmentParent ? *GarmentParent : INDEX_NONE);

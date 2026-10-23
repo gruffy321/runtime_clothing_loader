@@ -19,6 +19,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Math/Float16.h"
 #include "RCLImportData.h"
 #include "RCLSkeletonSnapshot.h"
 
@@ -40,13 +41,26 @@ struct FRCLPointGrid
 		TArray<int32>& OutIndices, TArray<float>& OutDistances) const;
 };
 
+/** A vector at half precision (6 bytes). Milestone 8 (TD 2026-10-23): body morph deltas are kept like
+ *  this to roughly halve the body copy. The engine's own GPU morph buffers are half precision too
+ *  (FMorphTargetVertexInfoBuffers, PF_R16F), so nothing is lost that the GPU would have kept: a 5 cm
+ *  delta is stored to about 0.02 mm. */
+struct FRCLHalfVector
+{
+	FFloat16 X, Y, Z;
+
+	FRCLHalfVector() {}
+	explicit FRCLHalfVector(const FVector& V) : X(V.X), Y(V.Y), Z(V.Z) {}
+	FVector ToVector() const { return FVector(X.GetFloat(), Y.GetFloat(), Z.GetFloat()); }
+};
+
 /** One morph target of the body (or an attachment), sparse. */
 struct FRCLBodyMorph
 {
 	FName Name;
-	TArray<int32> Vertex;         // index into FRCLBodySnapshot::Positions
-	TArray<FVector> PositionDelta;
-	TArray<FVector> NormalDelta;
+	TArray<int32> Vertex;                  // index into FRCLBodySnapshot::Positions
+	TArray<FRCLHalfVector> PositionDelta;
+	TArray<FRCLHalfVector> NormalDelta;
 };
 
 struct FRCLBodySnapshot

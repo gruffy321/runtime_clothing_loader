@@ -18,7 +18,7 @@ https://claude.ai/code/artifact/5aa967c7-c6ee-4bdc-ac25-a4987aa173c6
 | 5. Mesh builder | Verified 2026-10-21: DAZ bodysuit builds to 8682 vertices, 5 sections, in 1.5 ms (`RCL.Build`) |
 | 6. Resource writer | Verified 2026-10-23: DAZ bodysuit worn by the sandbox character through master pose (`RCL.Spawn`, 1.6 ms on the game thread); Shipping build links |
 | 7. Blueprint nodes and game integration | Verified 2026-10-23: RCL.Spawn through the pipeline, cache reuse, Set Clothing Materials variant, RCL.Check, nodes visible in Blueprint, Shipping build |
-| 8. Weight and morph transfer | Headers approved 2026-10-23; implementation awaiting editor test (`RCL.Spawn`, `RCL.Morph`) |
+| 8. Weight and morph transfer | First editor test 2026-10-23 (103 morphs, 92% fit). 0.9.0: body weights and bone orientations by default (`-fileweights` to compare), morph targets written over several frames (`rcl.WriteBudgetMs`), body morphs kept at half precision; awaiting editor retest |
 
 Each verified milestone has a frozen `verified/mN` branch; new work happens on a `milestone-N` branch
 and is merged into `main` only after it builds and passes its editor test.

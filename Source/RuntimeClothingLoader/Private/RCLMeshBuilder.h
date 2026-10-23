@@ -23,6 +23,7 @@
 #include "RCLTypes.h"
 #include "RCLImportData.h"
 #include "RCLTransfer.h"      // FRCLMorphDeltas (Milestone 8)
+#include "Animation/MorphTarget.h"   // FMorphTargetDelta (plain struct; filled on the worker)
 
 /** Skin weight of one render vertex, already in the engine's packed form. */
 struct FRCLBuiltSkinWeight
@@ -90,13 +91,13 @@ struct FRCLBuildStats
  * Render-ready data for one garment (one FRCLImportMesh). Parallel arrays, one entry per render
  * vertex, ordered section by section so every section's vertices are contiguous.
  */
-/** Milestone 8: one morph target on render vertices, ready for a UMorphTarget's LOD 0. */
+/** Milestone 8: one morph target on render vertices, ready for a UMorphTarget's LOD 0. The deltas are
+ *  already in the engine's own layout (made on the worker), so the game thread only moves the array
+ *  into the morph target. */
 struct FRCLBuiltMorph
 {
 	FName Name;
-	TArray<uint32> RenderVertex;      // ascending
-	TArray<FVector> PositionDelta;
-	TArray<FVector> TangentZDelta;    // normal delta
+	TArray<FMorphTargetDelta> Deltas; // ascending SourceIdx (render vertex); TangentZDelta = normal delta
 	TArray<int32> SectionIndices;     // sections containing at least one moved vertex
 };
 

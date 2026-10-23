@@ -20,6 +20,8 @@
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
+#include "Containers/Ticker.h"
+#include "HAL/IConsoleManager.h"
 
 // ---- Cache key ----------------------------------------------------------------------------------
 
@@ -109,7 +111,18 @@ struct FRCLLoadPipeline::FJob
 	TSharedPtr<const FRCLBodySnapshot, ESPMode::ThreadSafe> Body;
 	FString BodyError;
 	FRCLLoadReport Report;
+
+	// Milestone 8: game-thread writing over frames (one task per built mesh, done in order).
+	TArray<TUniquePtr<FRCLMeshWriteTask>> Writers;
+	int32 NextWriter = 0;
+	double WriteGameThreadMs = 0.0;
 };
+
+static TAutoConsoleVariable<float> CVarRCLWriteBudgetMs(
+	TEXT("rcl.WriteBudgetMs"),
+	2.0f,
+	TEXT("Runtime Clothing Loader: game-thread milliseconds per frame for writing loaded clothing (mesh setup and\n")
+	TEXT("morph targets). At least one piece is always done per frame. The final InitResources piece cannot be split."));
 
 namespace RCLPipeline
 {
@@ -299,6 +312,20 @@ void FRCLLoadPipeline::Shutdown()
 		Cancel(Id);
 	}
 	Queue.Reset();
+	for (const TSharedRef<FJob, ESPMode::ThreadSafe>& Job : WritingJobs)
+	{
+		for (TUniquePtr<FRCLMeshWriteTask>& Writer : Job->Writers)
+		{
+			Writer->Abort();   // un-roots half-written meshes
+		}
+		Job->Writers.Reset();
+	}
+	WritingJobs.Reset();
+	if (WriteTickerHandle.IsValid())
+	{
+		FTicker::GetCoreTicker().RemoveTicker(WriteTickerHandle);
+		WriteTickerHandle.Reset();
+	}
 	InFlightLoads.Reset();
 	Cache.Reset();
 
@@ -450,11 +477,21 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 	Report.Warnings.Append(Job.Bound.Warnings);
 
 	// ---- Milestone 8: transfer from the body -------------------------------------------------
-	// Weights: TransferAlways, or Auto when a garment has none or most of the file's weight sits on
-	// bones the character lacks (TD decision). Morphs: always, unless rigid or turned off.
+	// Weights and bind pose (TD, 2026-10-23): Auto and TransferAlways take BOTH from the base body for
+	// every garment, so clothing follows its rig, jiggle and extra bones exactly. FileWeights keeps the
+	// file's rig and only fills garments that have no weights. Rigid items: neither.
+	// Morphs: every body morph that moves the garment, unless rigid or turned off.
+	const ERCLSkinningMode Mode = Job.Options.SkinningMode;
 	const FRCLTransferSettings TransferSettings = FRCLTransferSettings::FromLoadOptions(Job.Options);
 	const FRCLBodySnapshot* Body = Job.Body.Get();
-	const bool bMorphs = Body && Job.Options.bTransferMorphTargets && Job.Options.SkinningMode != ERCLSkinningMode::RigidToBone;
+	if (!Body && Mode == ERCLSkinningMode::TransferAlways)
+	{
+		SetFailure(Report, ERCLFailureReason::MissingBodyMesh, FString::Printf(TEXT("Body weights required but the body could not be read: %s"), *Job.BodyError),
+			TEXT("The clothing could not be fitted to the character's body."));
+		return;
+	}
+	const bool bBodyRig = Body && (Mode == ERCLSkinningMode::Auto || Mode == ERCLSkinningMode::TransferAlways);
+	const bool bMorphs = Body && Job.Options.bTransferMorphTargets && Mode != ERCLSkinningMode::RigidToBone;
 	TArray<TArray<FRCLVertexMatch>> Matches;
 	Matches.SetNum(Job.Data.Meshes.Num());
 	FRCLTransferStats TransferStats;
@@ -463,9 +500,8 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 
 	for (int32 MeshIndex = 0; MeshIndex < Job.Data.Meshes.Num(); ++MeshIndex)
 	{
-		const bool bNeedWeights = Job.Options.SkinningMode == ERCLSkinningMode::TransferAlways
-			|| (Job.Options.SkinningMode == ERCLSkinningMode::Auto
-				&& (Job.Bound.MeshInfluences[MeshIndex].Num() == 0 || Job.Bound.bTransferRecommended));
+		const bool bNeedWeights = bBodyRig
+			|| (Mode == ERCLSkinningMode::FileWeights && (Job.Bound.MeshInfluences[MeshIndex].Num() == 0 || Job.Bound.bTransferRecommended));
 		if ((!bNeedWeights && !bMorphs) || !Body)
 		{
 			continue;
@@ -480,7 +516,7 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 			TArray<FRCLInfluence> TargetInfluences;
 			TArray<uint32> TargetStart;
 			FRCLTransfer::TransferWeights(Matches[MeshIndex], *Body, TargetInfluences, TargetStart);
-			FRCLSkeletonBinder::AddTargetInfluences(MeshIndex, TargetInfluences, TargetStart, Job.Snapshot, Job.Bound);
+			FRCLSkeletonBinder::AddTargetInfluences(MeshIndex, TargetInfluences, TargetStart, Job.Snapshot, /*bUseTargetPose*/ bBodyRig, Job.Bound);
 			Report.bUsedWeightTransfer = true;
 		}
 	}
@@ -493,7 +529,7 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 				WorstMatchRatio * 100.0f));
 		}
 	}
-	if (!Body && !Job.BodyError.IsEmpty() && Job.Options.SkinningMode != ERCLSkinningMode::RigidToBone)
+	if (!Body && !Job.BodyError.IsEmpty() && Mode != ERCLSkinningMode::RigidToBone)
 	{
 		Report.Warnings.Add(TEXT("The clothing will not follow body shape sliders: the body could not be read for fitting."));
 		UE_LOG(LogRuntimeClothing, Warning, TEXT("'%s': no body snapshot (%s)."), *FPaths::GetCleanFilename(Job.FilePath), *Job.BodyError);
@@ -562,7 +598,7 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 	{
 		UE_LOG(LogRuntimeClothing, Log, TEXT("'%s': fitted to %s; %.0f%% good match, furthest %.1f cm, %d morph(s) transferred, %d not affecting it, %s; %.1f ms."),
 			*FPaths::GetCleanFilename(Job.FilePath), *Body->SourceName, Report.TransferMatchRatio * 100.0f, Report.TransferMaxDistanceCm,
-			TransferStats.NumMorphsTransferred, TransferStats.NumMorphsSkipped, Report.bUsedWeightTransfer ? TEXT("weights from the body") : TEXT("file weights"),
+			TransferStats.NumMorphsTransferred, TransferStats.NumMorphsSkipped, bBodyRig ? TEXT("body weights and pose") : (Report.bUsedWeightTransfer ? TEXT("body weights where the file had none") : TEXT("file weights")),
 			TransferStats.TimeMs);
 	}
 	Report.WorkerTimeMs = (float)((FPlatformTime::Seconds() - Start) * 1000.0);
@@ -587,42 +623,120 @@ void FRCLLoadPipeline::CompleteOnGameThread(const TSharedRef<FJob, ESPMode::Thre
 		return;
 	}
 
-	InFlightLoads.Remove(Job->Key);
-
-	TArray<USkeletalMesh*> Meshes;
-	bool bSucceeded = Job->bWorkerSucceeded;
-	if (bSucceeded)
+	if (!Job->bWorkerSucceeded)
 	{
-		const double Start = FPlatformTime::Seconds();
+		FinishLoad(Job, false, TArray<USkeletalMesh*>());
+	}
+	else
+	{
+		// Milestone 8: written over the next frames within the budget (no hitch for many morph targets).
 		USkeleton* Skeleton = Job->Skeleton.Get();
-		if (!Skeleton || !Job->BodyMesh.IsValid())
+		const FRCLWriteSettings WriteSettings = FRCLWriteSettings::FromLoadOptions(Job->Options, Skeleton);
+		for (FRCLBuiltMesh& Built : Job->Built)
 		{
-			SetFailure(Report, ERCLFailureReason::MissingTargetSkeleton, TEXT("The body or its skeleton was unloaded during the load."));
-			bSucceeded = false;
+			Job->Writers.Add(MakeUnique<FRCLMeshWriteTask>(Built, Job->Bound, Job->Data, WriteSettings, /*bConsumeMorphs*/ true));
 		}
-		else
+		WritingJobs.Add(Job);
+		if (!WriteTickerHandle.IsValid())
 		{
-			const FRCLWriteSettings WriteSettings = FRCLWriteSettings::FromLoadOptions(Job->Options, Skeleton);
-			for (const FRCLBuiltMesh& Built : Job->Built)
+			WriteTickerHandle = FTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateRaw(this, &FRCLLoadPipeline::TickWrites), 0.0f);
+		}
+	}
+	StartQueuedJobs();   // the worker slot is free while this one writes
+}
+
+bool FRCLLoadPipeline::TickWrites(float DeltaTime)
+{
+	const double BudgetSeconds = FMath::Max(0.0f, CVarRCLWriteBudgetMs.GetValueOnGameThread()) / 1000.0;
+	const double FrameStart = FPlatformTime::Seconds();
+	bool bDidWork = false;
+
+	while (WritingJobs.Num() > 0 && !bShuttingDown)
+	{
+		TSharedRef<FJob, ESPMode::ThreadSafe> Job = WritingJobs[0];
+
+		// Nobody waiting any more (cancelled, or the world was torn down): stop writing.
+		bool bAnyoneWaiting = false;
+		for (uint32 Id : Job->WaiterIds)
+		{
+			bAnyoneWaiting |= ActiveRequests.Contains(Id);
+		}
+		if (!bAnyoneWaiting)
+		{
+			for (TUniquePtr<FRCLMeshWriteTask>& Writer : Job->Writers)
 			{
-				ERCLFailureReason Reason = ERCLFailureReason::None;
-				FString Error;
-				USkeletalMesh* Mesh = FRCLMeshWriter::Create(Built, Job->Bound, Job->Data, WriteSettings, Reason, Error);
-				if (!Mesh)
-				{
-					SetFailure(Report, Reason, Error);
-					bSucceeded = false;
-					Meshes.Reset();
-					break;
-				}
-				Meshes.Add(Mesh);
+				Writer->Abort();
 			}
+			WritingJobs.RemoveAt(0);
+			InFlightLoads.Remove(Job->Key);
+			continue;
 		}
-		Report.GameThreadTimeMs = (float)((FPlatformTime::Seconds() - Start) * 1000.0);
+
+		if (!Job->Skeleton.IsValid() || !Job->BodyMesh.IsValid())
+		{
+			for (TUniquePtr<FRCLMeshWriteTask>& Writer : Job->Writers)
+			{
+				Writer->Abort();
+			}
+			SetFailure(Job->Report, ERCLFailureReason::MissingTargetSkeleton, TEXT("The body or its skeleton was unloaded during the load."));
+			WritingJobs.RemoveAt(0);
+			FinishLoad(Job, false, TArray<USkeletalMesh*>());
+			continue;
+		}
+
+		// Out of budget: carry on next frame (but always do some work each frame).
+		const double Remaining = BudgetSeconds - (FPlatformTime::Seconds() - FrameStart);
+		if (bDidWork && Remaining <= 0.0)
+		{
+			break;
+		}
+
+		FRCLMeshWriteTask& Writer = *Job->Writers[Job->NextWriter];
+		const double StepStart = FPlatformTime::Seconds();
+		const bool bWriterFinished = Writer.Step(FMath::Max(Remaining, 0.0));
+		Job->WriteGameThreadMs += (FPlatformTime::Seconds() - StepStart) * 1000.0;
+		bDidWork = true;
+
+		if (bWriterFinished && Writer.HasFailed())
+		{
+			SetFailure(Job->Report, Writer.GetFailureReason(), Writer.GetError());
+			for (TUniquePtr<FRCLMeshWriteTask>& Other : Job->Writers)
+			{
+				Other->Abort();
+			}
+			WritingJobs.RemoveAt(0);
+			FinishLoad(Job, false, TArray<USkeletalMesh*>());
+			continue;
+		}
+		if (bWriterFinished && ++Job->NextWriter >= Job->Writers.Num())
+		{
+			// All written: take every mesh in this same frame (they stay rooted until now).
+			TArray<USkeletalMesh*> Meshes;
+			for (TUniquePtr<FRCLMeshWriteTask>& Done : Job->Writers)
+			{
+				Meshes.Add(Done->TakeResult());
+			}
+			WritingJobs.RemoveAt(0);
+			FinishLoad(Job, true, Meshes);
+		}
 	}
 
+	if (WritingJobs.Num() == 0 || bShuttingDown)
+	{
+		WriteTickerHandle.Reset();
+		return false;   // unregisters; CompleteOnGameThread registers again when needed
+	}
+	return true;
+}
+
+void FRCLLoadPipeline::FinishLoad(const TSharedRef<FJob, ESPMode::ThreadSafe>& Job, bool bSucceeded, const TArray<USkeletalMesh*>& Meshes)
+{
+	InFlightLoads.Remove(Job->Key);
+	FRCLLoadReport& Report = Job->Report;
+
 	if (bSucceeded)
 	{
+		Report.GameThreadTimeMs = (float)Job->WriteGameThreadMs;
 		FCacheEntry& Entry = Cache.FindOrAdd(Job->Key);
 		Entry.Meshes.Reset();
 		for (USkeletalMesh* Mesh : Meshes)
@@ -630,15 +744,27 @@ void FRCLLoadPipeline::CompleteOnGameThread(const TSharedRef<FJob, ESPMode::Thre
 			Entry.Meshes.Add(Mesh);
 		}
 		Entry.Report = Report;
-		UE_LOG(LogRuntimeClothing, Log, TEXT("Load Clothing: '%s' built %d mesh(es), %d vertices; worker %.1f ms, game thread %.2f ms."),
-			*FPaths::GetCleanFilename(Job->FilePath), Meshes.Num(), Report.NumVertices, Report.WorkerTimeMs, Report.GameThreadTimeMs);
+
+		FRCLMeshWriteTask::FTimings Total;
+		for (const TUniquePtr<FRCLMeshWriteTask>& Writer : Job->Writers)
+		{
+			const FRCLMeshWriteTask::FTimings& T = Writer->GetTimings();
+			Total.SetupMs += T.SetupMs;
+			Total.MorphsMs += T.MorphsMs;
+			Total.InitMs += T.InitMs;
+			Total.LongestPieceMs = FMath::Max(Total.LongestPieceMs, T.LongestPieceMs);
+			Total.NumSteps += T.NumSteps;
+		}
+		UE_LOG(LogRuntimeClothing, Log, TEXT("Load Clothing: '%s' built %d mesh(es), %d vertices, %d morph(s); worker %.1f ms, game thread %.2f ms over %d step(s) (setup %.2f, morph targets %.2f, init %.2f; longest piece %.2f ms)."),
+			*FPaths::GetCleanFilename(Job->FilePath), Meshes.Num(), Report.NumVertices, Report.NumMorphTargets, Report.WorkerTimeMs, Report.GameThreadTimeMs,
+			Total.NumSteps, Total.SetupMs, Total.MorphsMs, Total.InitMs, Total.LongestPieceMs);
 	}
+	Job->Writers.Reset();
 
 	for (uint32 Id : Job->WaiterIds)
 	{
 		AnswerLoad(Id, bSucceeded, Meshes, Report);
 	}
-	StartQueuedJobs();
 }
 
 void FRCLLoadPipeline::AnswerLoad(uint32 RequestId, bool bSucceeded, const TArray<USkeletalMesh*>& Meshes, const FRCLLoadReport& Report)

@@ -135,11 +135,83 @@ private:
 	 *  tessellation, which garment materials do not use. */
 	static void FillIndexBufferAndBones(FSkeletalMeshLODRenderData& LOD, const FRCLBuiltMesh& Built);
 
-	/** Milestone 8: one UMorphTarget per built morph (outer = the mesh, named as the body's morph so
-	 *  the body's sliders drive it through master pose), registered with USkeletalMesh::InitMorphTargets
-	 *  (exported) BEFORE InitResources, which builds the GPU morph buffers from them. */
-	static void CreateMorphTargets(USkeletalMesh& Mesh, const FRCLBuiltMesh& Built);
+	/** Milestone 8: one UMorphTarget (outer = the mesh, named as the body's morph so the body's sliders
+	 *  drive it through master pose). Deltas are copied, or moved when the caller allows it. */
+	static void CreateMorphTarget(USkeletalMesh& Mesh, const FRCLBuiltMesh& Built, FRCLBuiltMorph& Source, bool bMoveDeltas);
 
-	/** AllocateResourceForRendering, add the LOD, SetImportedBounds, InitResources. */
+	/** USkeletalMesh::InitMorphTargets (exported; must run BEFORE InitResources, which builds the GPU
+	 *  morph buffers), AllocateResourceForRendering, add the LOD, SetImportedBounds, InitResources. */
 	static void FinaliseAndInit(USkeletalMesh& Mesh, FSkeletalMeshLODRenderData* LOD, const FRCLBuiltMesh& Built);
+
+	friend class FRCLMeshWriteTask;
+};
+
+/**
+ * Milestone 8 (TD, 2026-10-23): the same writer, split over frames so a garment with many morph targets
+ * never causes a frame hitch (VR). Game thread only. Pieces, in order:
+ *   1. Setup: mesh object, skeleton, materials, vertex/index/weight buffers (one piece).
+ *   2. Morph targets: one UMorphTarget per piece, as many per frame as the budget allows.
+ *   3. Init: InitMorphTargets + InitResources (one piece; the engine builds the GPU morph buffers
+ *      inside InitResources in a single call, so that part cannot be split - its cost is logged).
+ * Between frames the unfinished mesh is rooted (AddToRoot) so garbage collection cannot take it;
+ * TakeResult un-roots it. An unfinished task is cleaned up by Abort (or its destructor).
+ */
+class FRCLMeshWriteTask
+{
+public:
+	/** Built, Bound and Data must outlive the task. With bConsumeMorphs the morph deltas are moved out of
+	 *  Built (no copy; the pipeline does not need them afterwards). Settings are copied. */
+	FRCLMeshWriteTask(FRCLBuiltMesh& Built, const FRCLBindResult& Bound, const FRCLImportData& Data,
+		const FRCLWriteSettings& Settings, bool bConsumeMorphs);
+	~FRCLMeshWriteTask();
+
+	/** Works through pieces until finished or BudgetSeconds have passed; always does at least one piece.
+	 *  Returns true once finished (succeeded or failed). */
+	bool Step(double BudgetSeconds);
+
+	bool IsFinished() const { return Stage == EStage::Done || Stage == EStage::Failed; }
+	bool HasFailed() const { return Stage == EStage::Failed; }
+	ERCLFailureReason GetFailureReason() const { return FailureReason; }
+	const FString& GetError() const { return Error; }
+
+	/** The finished mesh, un-rooted: the caller must reference it before garbage collection can run
+	 *  (i.e. in the same frame). Null if failed or already taken. */
+	USkeletalMesh* TakeResult();
+
+	/** Drops an unfinished mesh (un-root, mark pending kill, free the render data not yet handed over). */
+	void Abort();
+
+	/** Milliseconds per part, for the timing log. */
+	struct FTimings
+	{
+		double SetupMs = 0.0;
+		double MorphsMs = 0.0;
+		double InitMs = 0.0;          // InitMorphTargets + InitResources (includes the GPU morph buffers)
+		double LongestPieceMs = 0.0;
+		int32 NumSteps = 0;           // frames used
+	};
+	const FTimings& GetTimings() const { return Timings; }
+
+private:
+	enum class EStage : uint8 { Setup, Morphs, Init, Done, Failed };
+
+	void RunPiece();
+	void Fail(ERCLFailureReason Reason, const FString& InError);
+
+	FRCLBuiltMesh& Built;
+	const FRCLBindResult& Bound;
+	const FRCLImportData& Data;
+	FRCLWriteSettings Settings;
+	bool bConsumeMorphs;
+
+	EStage Stage = EStage::Setup;
+	USkeletalMesh* Mesh = nullptr;              // rooted while unfinished
+	FSkeletalMeshLODRenderData* LOD = nullptr;  // owned until Init hands it to the mesh
+	int32 NextMorph = 0;
+	ERCLFailureReason FailureReason = ERCLFailureReason::None;
+	FString Error;
+	FTimings Timings;
+
+	FRCLMeshWriteTask(const FRCLMeshWriteTask&) = delete;
+	FRCLMeshWriteTask& operator=(const FRCLMeshWriteTask&) = delete;
 };

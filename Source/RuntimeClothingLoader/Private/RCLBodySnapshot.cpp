@@ -259,8 +259,8 @@ namespace RCLBody
 					if ((int32)Delta.SourceIdx < NumVertices)
 					{
 						Copy.Vertex.Add(First + (int32)Delta.SourceIdx);
-						Copy.PositionDelta.Add(Delta.PositionDelta);
-						Copy.NormalDelta.Add(Delta.TangentZDelta);
+						Copy.PositionDelta.Add(FRCLHalfVector(Delta.PositionDelta));
+						Copy.NormalDelta.Add(FRCLHalfVector(Delta.TangentZDelta));
 					}
 				}
 			}
