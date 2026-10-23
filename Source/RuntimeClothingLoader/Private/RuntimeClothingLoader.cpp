@@ -27,7 +27,7 @@
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.6.0")
+#define RCL_PLUGIN_VERSION TEXT("0.6.1")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -370,53 +370,124 @@ namespace RCLConsole
 		return nullptr;
 	}
 
+	/** How well a component fits as "the body to dress". 0 = not a candidate. */
+	struct FBodyCandidate
+	{
+		USkeletalMeshComponent* Component = nullptr;
+		int32 Score = 0;
+		bool bOnScreen = false;
+		bool bPlayer = false;
+		bool bExactMesh = false;
+	};
+
 	/**
-	 * The body to dress. Only components that drive their own pose are candidates (MasterPoseComponent
-	 * unset): clothing already on a character shares the skeleton but follows the body, and 4.19 does
-	 * not chain master pose. Preference: the player's pawn over other characters (the sandbox scene
-	 * has several), then the exact body mesh over another mesh on the same skeleton.
+	 * Every component that could be the body. Only components that drive their own pose count
+	 * (MasterPoseComponent unset): clothing shares the skeleton but follows the body, and 4.19 does
+	 * not chain master pose. Ranking, strongest first:
+	 *   visible and drawn on screen in the last second (helper actors such as
+	 *   BP_MorphCollisionCalculator keep a hidden copy of the body), then the player's pawn, then
+	 *   the exact body mesh over another mesh on the same skeleton.
+	 * ActorFilter, when set, keeps only actors whose name contains it.
 	 */
-	USkeletalMeshComponent* FindBodyComponent(UWorld* World, USkeletalMesh* Body)
+	TArray<FBodyCandidate> FindBodyCandidates(UWorld* World, USkeletalMesh* Body, const FString& ActorFilter)
 	{
 		const APlayerController* Player = World->GetFirstPlayerController();
 		const APawn* PlayerPawn = Player ? Player->GetPawn() : nullptr;
+		const float Now = World->GetTimeSeconds();
 
-		USkeletalMeshComponent* Best = nullptr;
-		int32 BestScore = 0;
+		TArray<FBodyCandidate> Candidates;
 		for (TObjectIterator<USkeletalMeshComponent> It; It; ++It)
 		{
 			USkeletalMeshComponent* Component = *It;
-			if (Component->GetWorld() != World || !Component->SkeletalMesh || Component->IsPendingKill()
+			AActor* Owner = Component->GetOwner();
+			if (Component->GetWorld() != World || !Owner || !Component->SkeletalMesh || Component->IsPendingKill()
 				|| Component->MasterPoseComponent.IsValid()
 				|| SpawnedComponents.Contains(TWeakObjectPtr<USkeletalMeshComponent>(Component)))
 			{
 				continue;
 			}
-
-			int32 Score = 0;
-			if (Component->SkeletalMesh == Body)
-			{
-				Score = 2;
-			}
-			else if (Component->SkeletalMesh->Skeleton == Body->Skeleton)
-			{
-				Score = 1;
-			}
-			if (Score == 0)
+			if (!ActorFilter.IsEmpty() && !Owner->GetName().Contains(ActorFilter))
 			{
 				continue;
 			}
-			if (PlayerPawn && Component->GetOwner() == PlayerPawn)
+
+			FBodyCandidate Candidate;
+			Candidate.Component = Component;
+			Candidate.bExactMesh = Component->SkeletalMesh == Body;
+			if (!Candidate.bExactMesh && Component->SkeletalMesh->Skeleton != Body->Skeleton)
 			{
-				Score += 4;
+				continue;
 			}
-			if (Score > BestScore)
+			Candidate.bOnScreen = Component->IsVisible() && !Component->bHiddenInGame && !Owner->bHidden
+				&& Now - Component->LastRenderTimeOnScreen < 1.0f;
+			Candidate.bPlayer = PlayerPawn && Owner == PlayerPawn;
+			Candidate.Score = (Candidate.bOnScreen ? 8 : 0) + (Candidate.bPlayer ? 4 : 0) + (Candidate.bExactMesh ? 2 : 1);
+			Candidates.Add(Candidate);
+		}
+		Candidates.Sort([](const FBodyCandidate& A, const FBodyCandidate& B) { return A.Score > B.Score; });
+		return Candidates;
+	}
+
+	FString DescribeCandidate(const FBodyCandidate& Candidate)
+	{
+		return FString::Printf(TEXT("%s (%s), mesh '%s'%s%s%s"),
+			*Candidate.Component->GetOwner()->GetName(), *Candidate.Component->GetName(), *Candidate.Component->SkeletalMesh->GetName(),
+			Candidate.bOnScreen ? TEXT(", on screen") : TEXT(", not on screen"),
+			Candidate.bPlayer ? TEXT(", player") : TEXT(""),
+			Candidate.bExactMesh ? TEXT(", exact body mesh") : TEXT(", same skeleton"));
+	}
+
+	/** Splits off "-actor=Name" and "-halfuv"; returns the remaining arguments. */
+	TArray<FString> TakeSwitches(const TArray<FString>& Args, FString& OutActorFilter, bool& bOutHalfPrecisionUVs)
+	{
+		TArray<FString> Rest;
+		for (const FString& Arg : Args)
+		{
+			if (Arg.Equals(TEXT("-halfuv"), ESearchCase::IgnoreCase))
 			{
-				Best = Component;
-				BestScore = Score;
+				bOutHalfPrecisionUVs = true;
+			}
+			else if (Arg.StartsWith(TEXT("-actor="), ESearchCase::IgnoreCase))
+			{
+				OutActorFilter = Arg.Mid(7);
+			}
+			else
+			{
+				Rest.Add(Arg);
 			}
 		}
-		return Best;
+		return Rest;
+	}
+
+	void ListBodies(const TArray<FString>& Args)
+	{
+		FString ActorFilter;
+		bool bUnused = false;
+		TArray<FString> Rest = TakeSwitches(Args, ActorFilter, bUnused);
+
+		UWorld* World = FindPlayWorld();
+		if (!World)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.ListBodies: start Play-In-Editor first."));
+			return;
+		}
+		FString BodyPath = Rest.Num() > 0 ? Rest.Last() : FString(DefaultBodyPath);
+		if (!BodyPath.Contains(TEXT(".")))
+		{
+			BodyPath += TEXT(".") + FPaths::GetBaseFilename(BodyPath);
+		}
+		USkeletalMesh* Body = LoadObject<USkeletalMesh>(nullptr, *BodyPath);
+		if (!Body)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.ListBodies: could not load body mesh '%s'."), *BodyPath);
+			return;
+		}
+		const TArray<FBodyCandidate> Candidates = FindBodyCandidates(World, Body, ActorFilter);
+		UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.ListBodies: %d candidate(s) for '%s' (first is what RCL.Spawn picks):"), Candidates.Num(), *Body->GetName());
+		for (const FBodyCandidate& Candidate : Candidates)
+		{
+			UE_LOG(LogRuntimeClothing, Log, TEXT("  [%d] %s"), Candidate.Score, *DescribeCandidate(Candidate));
+		}
 	}
 
 	/** Worker output handed to the game thread. */
@@ -433,20 +504,11 @@ namespace RCLConsole
 
 	void Spawn(const TArray<FString>& Args)
 	{
-		// Optional switch: -halfuv writes 16-bit UVs (the engine import default) for comparison.
-		TArray<FString> FileArgs;
+		// Switches: -halfuv writes 16-bit UVs (the engine import default) for comparison;
+		// -actor=Name picks the character whose actor name contains Name (see RCL.ListBodies).
+		FString ActorFilter;
 		bool bHalfPrecisionUVs = false;
-		for (const FString& Arg : Args)
-		{
-			if (Arg.Equals(TEXT("-halfuv"), ESearchCase::IgnoreCase))
-			{
-				bHalfPrecisionUVs = true;
-			}
-			else
-			{
-				FileArgs.Add(Arg);
-			}
-		}
+		const TArray<FString> FileArgs = TakeSwitches(Args, ActorFilter, bHalfPrecisionUVs);
 
 		UWorld* World = FindPlayWorld();
 		if (!World)
@@ -463,12 +525,16 @@ namespace RCLConsole
 			return;
 		}
 
-		USkeletalMeshComponent* BodyComponent = FindBodyComponent(World, Body);
-		if (!BodyComponent)
+		const TArray<FBodyCandidate> Candidates = FindBodyCandidates(World, Body, ActorFilter);
+		if (Candidates.Num() == 0)
 		{
-			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: no character in the play world uses '%s' or its skeleton."), *Body->GetName());
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: no character in the play world uses '%s' or its skeleton%s."),
+				*Body->GetName(), ActorFilter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" with '%s' in its actor name"), *ActorFilter));
 			return;
 		}
+		USkeletalMeshComponent* BodyComponent = Candidates[0].Component;
+		UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Spawn: dressing %s%s"), *DescribeCandidate(Candidates[0]),
+			Candidates.Num() > 1 ? *FString::Printf(TEXT(" (%d other candidate(s); RCL.ListBodies lists them)"), Candidates.Num() - 1) : TEXT(""));
 		if (BodyComponent->SkeletalMesh != Body)
 		{
 			// Bind against the body actually being worn, so bone names and hierarchy match it.
@@ -602,8 +668,13 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(
 		TEXT("RCL.Spawn"),
-		TEXT("RCL.Spawn <file> [/Game/path/to/BodyMesh] [-halfuv]: during Play-In-Editor, load a file and put it on the character wearing that body (default: the female body), following it through master pose."),
+		TEXT("RCL.Spawn <file> [/Game/path/to/BodyMesh] [-actor=Name] [-halfuv]: during Play-In-Editor, load a file and put it on the on-screen character wearing that body (default: the female body), following it through master pose."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Spawn),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.ListBodies"),
+		TEXT("RCL.ListBodies [/Game/path/to/BodyMesh] [-actor=Name]: during Play-In-Editor, list the characters RCL.Spawn could dress, best first."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::ListBodies),
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(
 		TEXT("RCL.Clear"),
