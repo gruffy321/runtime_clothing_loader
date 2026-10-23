@@ -55,6 +55,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Runtime Clothing")
 	static int32 SetClothingMaterials(USkeletalMeshComponent* ClothingComponent, const TMap<FName, UMaterialInterface*>& MaterialsBySlot);
 
+	/**
+	 * Milestone 8: Prepare Body For Clothing. Copies the body's shape, weights and morphs for clothing
+	 * fitting now, instead of during the first Load Clothing for that body (a one-off cost of a few to
+	 * a few tens of milliseconds, depending on how many morphs the body has). Call it during a loading
+	 * screen for each base body (female, male) to keep the first equip hitch-free. Optional.
+	 * Returns false (and logs why) if the body cannot be used for fitting.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Runtime Clothing")
+	static bool PrepareBodyForClothing(USkeletalMesh* BodyMesh, const TArray<USkeletalMesh*>& AttachmentMeshes);
+
 	/** True for file types Load Clothing reads (.fbx, .obj), by extension only. */
 	UFUNCTION(BlueprintPure, Category = "Runtime Clothing")
 	static bool IsSupportedClothingFile(const FString& FilePath);

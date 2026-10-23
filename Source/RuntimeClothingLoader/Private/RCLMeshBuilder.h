@@ -22,6 +22,7 @@
 #include "GPUSkinPublicDefs.h"    // MAX_TOTAL_INFLUENCES (8), MAX_INFLUENCES_PER_STREAM (4)
 #include "RCLTypes.h"
 #include "RCLImportData.h"
+#include "RCLTransfer.h"      // FRCLMorphDeltas (Milestone 8)
 
 /** Skin weight of one render vertex, already in the engine's packed form. */
 struct FRCLBuiltSkinWeight
@@ -89,6 +90,16 @@ struct FRCLBuildStats
  * Render-ready data for one garment (one FRCLImportMesh). Parallel arrays, one entry per render
  * vertex, ordered section by section so every section's vertices are contiguous.
  */
+/** Milestone 8: one morph target on render vertices, ready for a UMorphTarget's LOD 0. */
+struct FRCLBuiltMorph
+{
+	FName Name;
+	TArray<uint32> RenderVertex;      // ascending
+	TArray<FVector> PositionDelta;
+	TArray<FVector> TangentZDelta;    // normal delta
+	TArray<int32> SectionIndices;     // sections containing at least one moved vertex
+};
+
 struct FRCLBuiltMesh
 {
 	FString Name;
@@ -138,6 +149,9 @@ struct FRCLBuiltMesh
 	/** Render vertex -> vertex index in the source FRCLImportMesh. Used by Milestone 8 (morph
 	 *  transfer, which works on source vertices) and for debugging. */
 	TArray<int32> SourceVertex;
+
+	/** Milestone 8: morph targets transferred from the body (empty when none). */
+	TArray<FRCLBuiltMorph> Morphs;
 
 	FRCLBuildStats Stats;
 	TArray<FString> Warnings;
@@ -195,6 +209,13 @@ public:
 	static bool Build(const FRCLImportMesh& Mesh, const TArray<FRCLInfluence>& Influences,
 		const TArray<uint32>& InfluenceStart, const TArray<int32>& BoneParents, const FRCLBuildSettings& Settings,
 		FRCLBuiltMesh& OutMesh, ERCLFailureReason& OutReason, FString& OutError);
+
+	/**
+	 * Milestone 8: expands source-vertex morph deltas onto render vertices through
+	 * OutMesh.SourceVertex (every render copy of a vertex moves the same) and fills Morphs. Call after
+	 * Build. Morphs that end up empty are dropped.
+	 */
+	static void BuildMorphs(const TArray<FRCLMorphDeltas>& SourceMorphs, FRCLBuiltMesh& InOutMesh);
 
 private:
 	/** Untrusted-input checks: array lengths agree, indices and bone indices in range, finite values. */

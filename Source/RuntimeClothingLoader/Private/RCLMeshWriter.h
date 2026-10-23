@@ -135,6 +135,11 @@ private:
 	 *  tessellation, which garment materials do not use. */
 	static void FillIndexBufferAndBones(FSkeletalMeshLODRenderData& LOD, const FRCLBuiltMesh& Built);
 
+	/** Milestone 8: one UMorphTarget per built morph (outer = the mesh, named as the body's morph so
+	 *  the body's sliders drive it through master pose), registered with USkeletalMesh::InitMorphTargets
+	 *  (exported) BEFORE InitResources, which builds the GPU morph buffers from them. */
+	static void CreateMorphTargets(USkeletalMesh& Mesh, const FRCLBuiltMesh& Built);
+
 	/** AllocateResourceForRendering, add the LOD, SetImportedBounds, InitResources. */
 	static void FinaliseAndInit(USkeletalMesh& Mesh, FSkeletalMeshLODRenderData* LOD, const FRCLBuiltMesh& Built);
 };

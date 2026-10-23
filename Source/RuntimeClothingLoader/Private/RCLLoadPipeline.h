@@ -2,8 +2,9 @@
 // Milestone 7: runs load and check requests for the Blueprint nodes. One instance, owned by the module.
 //
 // Thread plan per request (the same split RCL.Spawn proved in Milestone 6):
-//   game thread  - validate inputs, snapshot the body skeleton, look up the cache
-//   worker       - parse, bind, build (Milestones 3 to 5), at most MaxConcurrentWorkers at once
+//   game thread  - validate inputs, snapshot the body skeleton, look up the cache, and (Milestone 8)
+//                  fetch the shared body snapshot when weights or morphs will be transferred
+//   worker       - parse, bind, transfer (Milestone 8), build, at most MaxConcurrentWorkers at once
 //   game thread  - write the mesh (Milestone 6), store it in the cache, answer the request
 // UObjects are only touched on the game thread. Worker results travel in a shared, plain-data job.
 
@@ -92,8 +93,9 @@ private:
 	/** Game thread: options, file type, size limit, body present. Fills the report on failure. */
 	bool ValidateRequest(const FString& FilePath, const FRCLLoadOptions& Options, FRCLLoadReport& OutReport) const;
 
-	/** Game thread: live cached meshes for Key, if all are still alive (stale entries are removed). */
-	bool FindCached(const FRCLCacheKey& Key, TArray<USkeletalMesh*>& OutMeshes);
+	/** Game thread: live cached meshes for Key (if all are still alive; stale entries are removed) and
+	 *  the report of the build that made them (Milestone 8: a cache hit reports real counts). */
+	bool FindCached(const FRCLCacheKey& Key, TArray<USkeletalMesh*>& OutMeshes, FRCLLoadReport& OutReport);
 
 	/** Game thread: queue the job and start jobs while worker slots are free. */
 	void Enqueue(const TSharedRef<FJob, ESPMode::ThreadSafe>& Job);
@@ -120,7 +122,12 @@ private:
 	// ---- State (game thread only, except WorkersInFlight) ------------------------------------
 
 	TMap<uint32, FWaiter> ActiveRequests;
-	TMap<FRCLCacheKey, TArray<TWeakObjectPtr<USkeletalMesh>>> Cache;
+	struct FCacheEntry
+	{
+		TArray<TWeakObjectPtr<USkeletalMesh>> Meshes;
+		FRCLLoadReport Report;        // of the build that made them
+	};
+	TMap<FRCLCacheKey, FCacheEntry> Cache;
 	TMap<FRCLCacheKey, TSharedRef<FJob, ESPMode::ThreadSafe>> InFlightLoads;   // merges duplicate loads
 	TArray<TSharedRef<FJob, ESPMode::ThreadSafe>> Queue;
 	int32 RunningJobs = 0;

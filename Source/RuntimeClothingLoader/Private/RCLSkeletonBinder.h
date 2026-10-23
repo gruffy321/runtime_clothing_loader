@@ -111,6 +111,15 @@ public:
 	static bool Bind(const FRCLImportData& Data, const FRCLSkeletonSnapshot& Target, const FRCLBindSettings& Settings,
 		FRCLBindResult& OutResult, ERCLFailureReason& OutReason, FString& OutError);
 
+	/**
+	 * Milestone 8: replaces garment MeshIndex's influences with ones from weight transfer, given as
+	 * TARGET bone indices. Bones the garment skeleton lacks are added (with their ancestors, at the
+	 * target's reference pose; existing bones keep their file bind pose), in target order, and every
+	 * garment's influences are remapped to the new bone indices.
+	 */
+	static void AddTargetInfluences(int32 MeshIndex, const TArray<FRCLInfluence>& TargetInfluences,
+		const TArray<uint32>& TargetInfluenceStart, const FRCLSkeletonSnapshot& Target, FRCLBindResult& InOutResult);
+
 private:
 	/** File joint -> target bone index (or INDEX_NONE). The file root joint (no parent) maps to
 	 *  the target root when its name isn't a target bone. */

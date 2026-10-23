@@ -143,6 +143,10 @@ struct FRCLImportData
 	/** Non-fatal problems found while parsing; copied into FRCLLoadReport::Warnings. */
 	TArray<FString> Warnings;
 
+	/** Milestone 8: notices from the FBX reader itself (for example "Bad UTF-8 string (x19)": names it
+	 *  had to clean up). Logged, never shown to players. */
+	TArray<FString> TechnicalWarnings;
+
 	/** Approximate heap size, for logging and limits. */
 	SIZE_T GetAllocatedSize() const;
 };
