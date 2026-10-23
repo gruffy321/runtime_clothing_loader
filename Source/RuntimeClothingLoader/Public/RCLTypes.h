@@ -248,6 +248,11 @@ struct RUNTIMECLOTHINGLOADER_API FRCLLoadReport
 	UPROPERTY(BlueprintReadOnly, Category = "Report")
 	ERCLFailureReason FailureReason = ERCLFailureReason::None;
 
+	/** Milestone 7: why the load failed, as one sentence a player can read ("The file is larger than
+	 *  64 MB."). Empty on success. */
+	UPROPERTY(BlueprintReadOnly, Category = "Report")
+	FString ErrorMessage;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Report")
 	int32 NumVertices = 0;
 
@@ -291,4 +296,23 @@ struct RUNTIMECLOTHINGLOADER_API FRCLLoadReport
 	/** Game-thread time (mesh assembly), in ms. Must stay small: the game runs in VR. */
 	UPROPERTY(BlueprintReadOnly, Category = "Report")
 	float GameThreadTimeMs = 0.0f;
+};
+
+/**
+ * Milestone 7: what Check Clothing File returns. Nothing is built; this describes what Load Clothing
+ * would produce with the same file and options.
+ */
+USTRUCT(BlueprintType)
+struct RUNTIMECLOTHINGLOADER_API FRCLCheckResult
+{
+	GENERATED_BODY()
+
+	/** As Load Clothing's report, including FailureReason / ErrorMessage when unusable. */
+	UPROPERTY(BlueprintReadOnly, Category = "Check")
+	FRCLLoadReport Report;
+
+	/** Every mesh part in the file, including ones the options would skip, so the upload screen can
+	 *  offer them (pass names back in IncludeMeshNodes / ExcludeMeshNodes). */
+	UPROPERTY(BlueprintReadOnly, Category = "Check")
+	TArray<FRCLMeshNodeInfo> Parts;
 };
