@@ -26,7 +26,7 @@ public:
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
 
-	/** The module is safe to reload: it holds no global state. */
+	/** Safe to reload: the load pipeline is shut down (requests cancelled, workers drained) first. */
 	virtual bool SupportsDynamicReloading() override { return true; }
 
 	/** Convenience accessor; loads the module if needed. Game thread only. */
@@ -59,6 +59,11 @@ private:
 	 *                       -actor= picks a character by actor name; -halfuv writes 16-bit UVs.
 	 *   RCL.ListBodies [body mesh path]  lists the characters RCL.Spawn could dress, best first.
 	 *   RCL.Clear           removes every garment added by RCL.Spawn.
+	 *   RCL.Check <file> [body mesh path]  (Milestone 7) runs Check Clothing File and logs the result.
+	 *   RCL.Variant <slot name> <material path>  sets one material slot on the last RCL.Spawn garment
+	 *                       through Set Clothing Materials.
+	 * Since Milestone 7, RCL.Spawn goes through the same pipeline as the Load Clothing node, so running
+	 * it twice shows the shared cache at work.
 	 * Not compiled into Shipping builds.
 	 */
 	void RegisterConsoleCommands();
@@ -66,4 +71,7 @@ private:
 
 	TArray<class IConsoleObject*> ConsoleCommands;
 #endif
+
+	/** FWorldDelegates::OnWorldCleanup: cancels a world's pending loads so no answer reaches a dead world. */
+	FDelegateHandle WorldCleanupHandle;
 };

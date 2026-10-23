@@ -70,11 +70,17 @@ public:
 	virtual void Activate() override;
 
 private:
-	/** Called on the game thread by the loader when the request finishes or is dropped. */
+	/** Called on the game thread by the loader when the request finishes or is dropped. A dropped
+	 *  request (FailureReason Cancelled: world torn down) fires no pin; the node just cleans up. */
 	void Finish(bool bSucceeded, const TArray<USkeletalMesh*>& Meshes, const FRCLLoadReport& Report);
 
 	TWeakObjectPtr<UObject> WorldContext;
 	FString FilePath;
+
+	/** UPROPERTY so garbage collection keeps Options.BodyMesh and the override materials alive while
+	 *  the request runs. 4.19's base class only sets RF_StrongRefOnFrame, so the node roots itself in
+	 *  Activate and unroots when it finishes; every path ends there. */
+	UPROPERTY()
 	FRCLLoadOptions Options;
 
 	/** Id in the loader's queue; lets the loader drop this request if the world goes away. */
@@ -112,6 +118,11 @@ private:
 
 	TWeakObjectPtr<UObject> WorldContext;
 	FString FilePath;
+
+	/** UPROPERTY so garbage collection keeps Options.BodyMesh and the override materials alive while
+	 *  the request runs. 4.19's base class only sets RF_StrongRefOnFrame, so the node roots itself in
+	 *  Activate and unroots when it finishes; every path ends there. */
+	UPROPERTY()
 	FRCLLoadOptions Options;
 	uint32 RequestId = 0;
 };

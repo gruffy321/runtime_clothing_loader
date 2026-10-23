@@ -2,6 +2,8 @@
 // Module entry point, plus test console commands in non-Shipping builds.
 
 #include "RuntimeClothingLoader.h"
+#include "RCLLoadPipeline.h"        // all builds: world cleanup and shutdown
+#include "Engine/World.h"          // FWorldDelegates
 
 #if !UE_BUILD_SHIPPING
 #include "IRCLMeshParser.h"
@@ -15,6 +17,9 @@
 #include "RCLMeshBuilder.h"
 #include "GPUSkinVertexFactory.h"
 #include "RCLMeshWriter.h"
+#include "RCLLoadPipeline.h"
+#include "RCLClothingLibrary.h"
+#include "Materials/MaterialInterface.h"
 #include "Animation/Skeleton.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/Engine.h"
@@ -27,7 +32,7 @@
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.6.2")
+#define RCL_PLUGIN_VERSION TEXT("0.7.0")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -491,17 +496,25 @@ namespace RCLConsole
 		}
 	}
 
-	/** Worker output handed to the game thread. */
-	struct FSpawnJob
+	/** The play world if any, else the first world (the editor's) so RCL.Check also works outside play. */
+	UWorld* AnyWorld()
 	{
-		FString Path;
-		FRCLSkeletonSnapshot Snapshot;
-		FRCLImportData Data;
-		FRCLBindResult Bound;
-		TArray<FRCLBuiltMesh> Built;
-		bool bHalfPrecisionUVs = false;
-		double WorkerMs = 0.0;
-	};
+		if (UWorld* Play = FindPlayWorld())
+		{
+			return Play;
+		}
+		if (GEngine)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World())
+				{
+					return Context.World();
+				}
+			}
+		}
+		return nullptr;
+	}
 
 	void Spawn(const TArray<FString>& Args)
 	{
@@ -518,10 +531,10 @@ namespace RCLConsole
 			return;
 		}
 
-		TSharedRef<FSpawnJob> Job = MakeShared<FSpawnJob>();
-		Job->bHalfPrecisionUVs = bHalfPrecisionUVs;
+		FString Path;
+		FRCLSkeletonSnapshot UnusedSnapshot;
 		USkeletalMesh* Body = nullptr;
-		if (!PrepareBodyCommand(TEXT("RCL.Spawn"), FileArgs, Job->Path, Job->Snapshot, &Body))
+		if (!PrepareBodyCommand(TEXT("RCL.Spawn"), FileArgs, Path, UnusedSnapshot, &Body))
 		{
 			return;
 		}
@@ -536,96 +549,103 @@ namespace RCLConsole
 		USkeletalMeshComponent* BodyComponent = Candidates[0].Component;
 		UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Spawn: dressing %s%s"), *DescribeCandidate(Candidates[0]),
 			Candidates.Num() > 1 ? *FString::Printf(TEXT(" (%d other candidate(s); RCL.ListBodies lists them)"), Candidates.Num() - 1) : TEXT(""));
-		if (BodyComponent->SkeletalMesh != Body)
-		{
-			// Bind against the body actually being worn, so bone names and hierarchy match it.
-			Job->Snapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*BodyComponent->SkeletalMesh);
-		}
+
+		// Same path as the Load Clothing node: the pipeline, then Put Clothing On Character.
+		FRCLLoadOptions Options;
+		Options.BodyMesh = BodyComponent->SkeletalMesh;   // the body actually worn
+		Options.bUseFullPrecisionUVs = !bHalfPrecisionUVs;
 		const TWeakObjectPtr<USkeletalMeshComponent> WeakBody(BodyComponent);
-		const int32 MaxGPUSkinBones = FGPUBaseSkinVertexFactory::GetMaxGPUSkinBones();
 
-		Async<void>(EAsyncExecution::ThreadPool, [Job, WeakBody, MaxGPUSkinBones]()
+		FRCLLoadPipeline::Get().RequestLoad(World, Path, Options, FRCLLoadDone::CreateLambda(
+			[WeakBody, Path](bool bSucceeded, const TArray<USkeletalMesh*>& Meshes, const FRCLLoadReport& Report)
 		{
-			const double Start = FPlatformTime::Seconds();
-			const FRCLLoadOptions Options;
-			ERCLFailureReason Reason = ERCLFailureReason::None;
-			FString Error;
-
-			TUniquePtr<IRCLMeshParser> Parser = IRCLMeshParser::CreateForFile(Job->Path);
-			if (!Parser)
+			if (!bSucceeded)
 			{
-				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: unsupported file type: %s"), *Job->Path);
-				return;
-			}
-			if (!Parser->Parse(Job->Path, FRCLParseSettings::FromLoadOptions(Options), Job->Data, Reason, Error))
-			{
-				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: parse failed (%s): %s"), FailureName(Reason), *Error);
-				return;
-			}
-			if (!FRCLSkeletonBinder::Bind(Job->Data, Job->Snapshot, FRCLBindSettings::FromLoadOptions(Options), Job->Bound, Reason, Error))
-			{
-				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: bind failed (%s): %s"), FailureName(Reason), *Error);
-				return;
-			}
-			const FRCLBuildSettings BuildSettings = FRCLBuildSettings::FromLoadOptions(Options, MaxGPUSkinBones);
-			for (int32 MeshIndex = 0; MeshIndex < Job->Data.Meshes.Num(); ++MeshIndex)
-			{
-				FRCLBuiltMesh Built;
-				if (!FRCLMeshBuilder::Build(Job->Data.Meshes[MeshIndex], Job->Bound.MeshInfluences[MeshIndex],
-					Job->Bound.MeshInfluenceStart[MeshIndex], Job->Bound.ParentIndices, BuildSettings, Built, Reason, Error))
+				if (Report.FailureReason != ERCLFailureReason::Cancelled)
 				{
-					UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: garment '%s' build failed (%s): %s"),
-						*Job->Data.Meshes[MeshIndex].Name, FailureName(Reason), *Error);
+					UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: %s (%s)"), *Report.ErrorMessage, FailureName(Report.FailureReason));
+				}
+				return;
+			}
+			USkeletalMeshComponent* BodyComponent = WeakBody.Get();
+			if (!BodyComponent)
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: the character went away before the garment was ready."));
+				return;
+			}
+			for (USkeletalMesh* Garment : Meshes)
+			{
+				USkeletalMeshComponent* Component = URCLClothingLibrary::PutClothingOnCharacter(BodyComponent, Garment, NAME_None, FTransform::Identity);
+				if (!Component)
+				{
 					continue;
 				}
-				Job->Built.Add(MoveTemp(Built));
+				SpawnedComponents.Add(Component);
+				UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Spawn %s: '%s' on %s (%s), master pose; %d section(s), %d material slot(s); worker %.1f ms, game thread %.2f ms"),
+					*FPaths::GetCleanFilename(Path), *Garment->GetName(), *BodyComponent->GetOwner()->GetName(), *BodyComponent->GetName(),
+					Report.NumSections, Garment->Materials.Num(), Report.WorkerTimeMs, Report.GameThreadTimeMs);
 			}
-			Job->WorkerMs = (FPlatformTime::Seconds() - Start) * 1000.0;
-			if (Job->Built.Num() == 0)
+			for (const FString& Warning : Report.Warnings)
 			{
-				return;
+				UE_LOG(LogRuntimeClothing, Log, TEXT("  Warning: %s"), *Warning);
 			}
+		}));
+	}
 
-			AsyncTask(ENamedThreads::GameThread, [Job, WeakBody]()
+	void Check(const TArray<FString>& Args)
+	{
+		UWorld* World = AnyWorld();
+		FString Path;
+		FRCLSkeletonSnapshot UnusedSnapshot;
+		USkeletalMesh* Body = nullptr;
+		if (!World || !PrepareBodyCommand(TEXT("RCL.Check"), Args, Path, UnusedSnapshot, &Body))
+		{
+			return;
+		}
+		FRCLLoadOptions Options;
+		Options.BodyMesh = Body;
+		FRCLLoadPipeline::Get().RequestCheck(World, Path, Options, FRCLCheckDone::CreateLambda(
+			[Path](bool bUsable, const FRCLCheckResult& Result)
+		{
+			const FRCLLoadReport& Report = Result.Report;
+			UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Check %s: %s%s"), *FPaths::GetCleanFilename(Path),
+				bUsable ? TEXT("usable") : TEXT("NOT usable: "), bUsable ? TEXT("") : *Report.ErrorMessage);
+			UE_LOG(LogRuntimeClothing, Log, TEXT("  %d vertices, %d triangles, %d section(s); %d bone(s) matched, %d unknown; worker %.1f ms"),
+				Report.NumVertices, Report.NumTriangles, Report.NumSections, Report.MatchedBones.Num(), Report.UnknownBones.Num(), Report.WorkerTimeMs);
+			for (const FRCLMeshNodeInfo& Part : Result.Parts)
 			{
-				USkeletalMeshComponent* BodyComponent = WeakBody.Get();
-				if (!BodyComponent || !BodyComponent->SkeletalMesh || !BodyComponent->GetOwner())
-				{
-					UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: the character went away before the garment was ready (play stopped?)."));
-					return;
-				}
+				UE_LOG(LogRuntimeClothing, Log, TEXT("  Part '%s': %d vertices, %d triangles%s%s"), *Part.Name, Part.NumVertices, Part.NumTriangles,
+					Part.bIsSkinned ? TEXT(", skinned") : TEXT(""), Part.bLooksLikeDazFigure ? TEXT(", DAZ figure (skipped by default)") : TEXT(""));
+			}
+			for (const FString& Warning : Report.Warnings)
+			{
+				UE_LOG(LogRuntimeClothing, Log, TEXT("  Warning: %s"), *Warning);
+			}
+		}));
+	}
 
-				FRCLWriteSettings WriteSettings = FRCLWriteSettings::FromLoadOptions(FRCLLoadOptions(), BodyComponent->SkeletalMesh->Skeleton);
-				WriteSettings.bUseFullPrecisionUVs = !Job->bHalfPrecisionUVs;
-
-				for (const FRCLBuiltMesh& Built : Job->Built)
-				{
-					const double Start = FPlatformTime::Seconds();
-					ERCLFailureReason Reason = ERCLFailureReason::None;
-					FString Error;
-					USkeletalMesh* Garment = FRCLMeshWriter::Create(Built, Job->Bound, Job->Data, WriteSettings, Reason, Error);
-					if (!Garment)
-					{
-						UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: garment '%s' could not be created (%s): %s"), *Built.Name, FailureName(Reason), *Error);
-						continue;
-					}
-
-					AActor* Owner = BodyComponent->GetOwner();
-					USkeletalMeshComponent* Component = NewObject<USkeletalMeshComponent>(Owner, MakeUniqueObjectName(Owner, USkeletalMeshComponent::StaticClass(), Garment->GetFName()), RF_Transient);
-					Component->SetupAttachment(BodyComponent);
-					Component->SetSkeletalMesh(Garment);
-					Component->RegisterComponent();
-					Component->SetMasterPoseComponent(BodyComponent);   // after registering, so the bone map is built against a live component
-					SpawnedComponents.Add(Component);
-					const double WriteMs = (FPlatformTime::Seconds() - Start) * 1000.0;
-
-					UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Spawn %s: '%s' on %s (%s), master pose; %d vertices, %d section(s), %d material slot(s), %s UVs; worker %.1f ms, game thread %.2f ms"),
-						*FPaths::GetCleanFilename(Job->Path), *Garment->GetName(), *Owner->GetName(), *BodyComponent->GetName(),
-						Built.NumVertices(), Built.Sections.Num(), Built.MaterialSlots.Num(),
-						WriteSettings.bUseFullPrecisionUVs ? TEXT("32-bit") : TEXT("16-bit"), Job->WorkerMs, WriteMs);
-				}
-			});
-		});
+	void Variant(const TArray<FString>& Args)
+	{
+		USkeletalMeshComponent* Component = nullptr;
+		for (int32 Index = SpawnedComponents.Num() - 1; Index >= 0 && !Component; --Index)
+		{
+			Component = SpawnedComponents[Index].Get();
+		}
+		if (Args.Num() != 2 || !Component)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("Usage: RCL.Variant <slot name> <material object path>, after RCL.Spawn. Example: RCL.Variant suit_front /Engine/EngineMaterials/WorldGridMaterial.WorldGridMaterial"));
+			return;
+		}
+		UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *Args[1]);
+		if (!Material)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Variant: could not load material '%s'."), *Args[1]);
+			return;
+		}
+		TMap<FName, UMaterialInterface*> MaterialsBySlot;
+		MaterialsBySlot.Add(FName(*Args[0]), Material);
+		const int32 NumSet = URCLClothingLibrary::SetClothingMaterials(Component, MaterialsBySlot);
+		UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Variant: set %d slot(s) on '%s'."), NumSet, *Component->GetName());
 	}
 
 	void Clear(const TArray<FString>& Args)
@@ -678,6 +698,16 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::ListBodies),
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.Check"),
+		TEXT("RCL.Check <file> [/Game/path/to/BodyMesh]: run Check Clothing File on a file and log the result (default body: the female body)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Check),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.Variant"),
+		TEXT("RCL.Variant <slot name> <material object path>: set one material slot on the last RCL.Spawn garment (Set Clothing Materials)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Variant),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
 		TEXT("RCL.Clear"),
 		TEXT("RCL.Clear: remove every garment added by RCL.Spawn."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Clear),
@@ -699,8 +729,13 @@ void FRuntimeClothingLoaderModule::UnregisterConsoleCommands()
 
 void FRuntimeClothingLoaderModule::StartupModule()
 {
-	// No global state to create: every load builds its own parser, binder and builders.
 	UE_LOG(LogRuntimeClothing, Log, TEXT("Runtime Clothing Loader %s started."), RCL_PLUGIN_VERSION);
+
+	// A world being torn down (level change, play stopped) cancels its pending loads.
+	WorldCleanupHandle = FWorldDelegates::OnWorldCleanup.AddLambda([](UWorld* World, bool /*bSessionEnded*/, bool /*bCleanupResources*/)
+	{
+		FRCLLoadPipeline::Get().CancelAllForWorld(World);
+	});
 
 #if !UE_BUILD_SHIPPING
 	RegisterConsoleCommands();
@@ -709,6 +744,9 @@ void FRuntimeClothingLoaderModule::StartupModule()
 
 void FRuntimeClothingLoaderModule::ShutdownModule()
 {
+	FWorldDelegates::OnWorldCleanup.Remove(WorldCleanupHandle);
+	FRCLLoadPipeline::Get().Shutdown();
+
 #if !UE_BUILD_SHIPPING
 	UnregisterConsoleCommands();
 #endif

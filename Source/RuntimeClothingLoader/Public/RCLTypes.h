@@ -173,6 +173,11 @@ struct RUNTIMECLOTHINGLOADER_API FRCLLoadOptions
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Geometry")
 	bool bEnablePerPolyCollision = false;
 
+	/** Milestone 7: 32-bit texture coordinates (default) instead of the engine import default of 16-bit.
+	 *  Costs 4 bytes per vertex per UV set and avoids texture swimming on detailed layouts. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Geometry")
+	bool bUseFullPrecisionUVs = true;
+
 	// ---- Materials -------------------------------------------------------------------
 
 	/** Material per section, by index. Missing entries fall back to DefaultMaterial. */

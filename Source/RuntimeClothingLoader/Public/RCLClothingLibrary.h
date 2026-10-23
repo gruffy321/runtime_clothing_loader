@@ -12,6 +12,7 @@
 
 class USkeletalMesh;
 class USkeletalMeshComponent;
+class UMaterialInterface;
 
 UCLASS()
 class RUNTIMECLOTHINGLOADER_API URCLClothingLibrary : public UBlueprintFunctionLibrary
@@ -43,6 +44,16 @@ public:
 	 *  once nothing else wears it. */
 	UFUNCTION(BlueprintCallable, Category = "Runtime Clothing")
 	static void RemoveClothingFromCharacter(USkeletalMeshComponent* ClothingComponent);
+
+	/**
+	 * Set Clothing Materials: applies a variant. Sets each named material slot on the component and
+	 * leaves the others alone; returns how many slots were set. Slots are matched by NAME (the file's
+	 * material names, for example "suit_front"), so a variant stays correct if a re-export changes the
+	 * slot order. Unknown names are logged and skipped. Works for runtime and editor-imported clothing,
+	 * and never touches the shared mesh.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Runtime Clothing")
+	static int32 SetClothingMaterials(USkeletalMeshComponent* ClothingComponent, const TMap<FName, UMaterialInterface*>& MaterialsBySlot);
 
 	/** True for file types Load Clothing reads (.fbx, .obj), by extension only. */
 	UFUNCTION(BlueprintPure, Category = "Runtime Clothing")

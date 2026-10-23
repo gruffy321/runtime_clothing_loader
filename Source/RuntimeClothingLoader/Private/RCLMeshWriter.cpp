@@ -23,6 +23,7 @@ FRCLWriteSettings FRCLWriteSettings::FromLoadOptions(const FRCLLoadOptions& Opti
 	Settings.MaterialOverrides = Options.MaterialOverrides;
 	Settings.DefaultMaterial = Options.DefaultMaterial;
 	Settings.bAllowCPUAccess = Options.bEnablePerPolyCollision;
+	Settings.bUseFullPrecisionUVs = Options.bUseFullPrecisionUVs;
 	return Settings;
 }
 
