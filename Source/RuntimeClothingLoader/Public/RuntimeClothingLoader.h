@@ -53,6 +53,10 @@ private:
 	 *                       root mapping, matched / unknown bones and the largest bind offset.
 	 *   RCL.Build <file> [body mesh path]  (Milestone 5) as RCL.Bind, then builds render data for
 	 *                       each garment and logs vertices, sections, influences, tangents, bounds.
+	 *   RCL.Spawn <file> [body mesh path] [-halfuv]  (Milestone 6) during Play-In-Editor: full
+	 *                       pipeline, then puts the garment on the character wearing that body
+	 *                       through SetMasterPoseComponent. -halfuv writes 16-bit UVs to compare.
+	 *   RCL.Clear           removes every garment added by RCL.Spawn.
 	 * Not compiled into Shipping builds.
 	 */
 	void RegisterConsoleCommands();

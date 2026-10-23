@@ -81,7 +81,7 @@ struct FRCLBuildStats
 	bool bTangentsComputed = false;        // false when the file supplied tangents and we kept them
 	int32 NumDegenerateTangents = 0;       // no usable UV gradient; an arbitrary perpendicular was used
 
-	bool bUse32BitIndices = false;
+	bool bUse32BitIndices = false;         // true from MAX_uint16 (65535) vertices, as the engine decides
 	double BuildTimeMs = 0.0;
 };
 

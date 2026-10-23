@@ -616,7 +616,8 @@ void FRCLMeshBuilder::Finalise(const FRCLImportMesh& Mesh, const TArray<int32>& 
 	Stats.NumRenderVertices = OutMesh.NumVertices();
 	Stats.NumTriangles = OutMesh.Indices.Num() / 3;
 	Stats.NumSections = OutMesh.Sections.Num();
-	Stats.bUse32BitIndices = OutMesh.NumVertices() > (int32)MAX_uint16 + 1;
+	// The engine's own rule (FSkeletalMeshLODRenderData::BuildFromLODModel): 16-bit below MAX_uint16.
+	Stats.bUse32BitIndices = OutMesh.NumVertices() >= (int32)MAX_uint16;
 }
 
 bool FRCLMeshBuilder::Build(const FRCLImportMesh& Mesh, const TArray<FRCLInfluence>& Influences,

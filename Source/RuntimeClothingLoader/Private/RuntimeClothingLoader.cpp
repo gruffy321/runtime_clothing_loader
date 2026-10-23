@@ -14,11 +14,18 @@
 #include "RCLSkeletonBinder.h"
 #include "RCLMeshBuilder.h"
 #include "GPUSkinVertexFactory.h"
+#include "RCLMeshWriter.h"
+#include "Animation/Skeleton.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "UObject/UObjectIterator.h"
 #include "Engine/SkeletalMesh.h"
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.5.0")
+#define RCL_PLUGIN_VERSION TEXT("0.6.0")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -161,7 +168,8 @@ namespace RCLConsole
 	 * Shared by RCL.Bind and RCL.Build. Splits "<file> [/Game/BodyMesh]" and, on the game thread,
 	 * loads the body and copies its skeleton so the worker never touches UObjects.
 	 */
-	bool PrepareBodyCommand(const TCHAR* Command, const TArray<FString>& Args, FString& OutPath, FRCLSkeletonSnapshot& OutSnapshot)
+	bool PrepareBodyCommand(const TCHAR* Command, const TArray<FString>& Args, FString& OutPath, FRCLSkeletonSnapshot& OutSnapshot,
+		USkeletalMesh** OutBody = nullptr)
 	{
 		// Optional last argument: a body mesh object path (starts with /Game/). Everything before
 		// it is the file path, which may contain spaces.
@@ -189,6 +197,10 @@ namespace RCLConsole
 			return false;
 		}
 		OutSnapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*Body);
+		if (OutBody)
+		{
+			*OutBody = Body;
+		}
 		return true;
 	}
 
@@ -335,6 +347,207 @@ namespace RCLConsole
 			}
 		});
 	}
+
+	/** Components made by RCL.Spawn, so RCL.Clear can remove them. Game thread only. */
+	static TArray<TWeakObjectPtr<USkeletalMeshComponent>> SpawnedComponents;
+
+	/** The Play-In-Editor world, or the game world in a standalone game. */
+	UWorld* FindPlayWorld()
+	{
+		if (!GEngine)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if ((Context.WorldType == EWorldType::PIE || Context.WorldType == EWorldType::Game) && Context.World())
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	/** First skeletal mesh component in World showing Body; else the first on Body's skeleton. */
+	USkeletalMeshComponent* FindBodyComponent(UWorld* World, USkeletalMesh* Body)
+	{
+		USkeletalMeshComponent* SameSkeleton = nullptr;
+		for (TObjectIterator<USkeletalMeshComponent> It; It; ++It)
+		{
+			USkeletalMeshComponent* Component = *It;
+			if (Component->GetWorld() != World || !Component->SkeletalMesh || Component->IsPendingKill()
+				|| SpawnedComponents.Contains(TWeakObjectPtr<USkeletalMeshComponent>(Component)))
+			{
+				continue;
+			}
+			if (Component->SkeletalMesh == Body)
+			{
+				return Component;
+			}
+			if (!SameSkeleton && Component->SkeletalMesh->Skeleton == Body->Skeleton)
+			{
+				SameSkeleton = Component;
+			}
+		}
+		return SameSkeleton;
+	}
+
+	/** Worker output handed to the game thread. */
+	struct FSpawnJob
+	{
+		FString Path;
+		FRCLSkeletonSnapshot Snapshot;
+		FRCLImportData Data;
+		FRCLBindResult Bound;
+		TArray<FRCLBuiltMesh> Built;
+		bool bHalfPrecisionUVs = false;
+		double WorkerMs = 0.0;
+	};
+
+	void Spawn(const TArray<FString>& Args)
+	{
+		// Optional switch: -halfuv writes 16-bit UVs (the engine import default) for comparison.
+		TArray<FString> FileArgs;
+		bool bHalfPrecisionUVs = false;
+		for (const FString& Arg : Args)
+		{
+			if (Arg.Equals(TEXT("-halfuv"), ESearchCase::IgnoreCase))
+			{
+				bHalfPrecisionUVs = true;
+			}
+			else
+			{
+				FileArgs.Add(Arg);
+			}
+		}
+
+		UWorld* World = FindPlayWorld();
+		if (!World)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: start Play-In-Editor first; the garment is put on a character in the running game."));
+			return;
+		}
+
+		TSharedRef<FSpawnJob> Job = MakeShared<FSpawnJob>();
+		Job->bHalfPrecisionUVs = bHalfPrecisionUVs;
+		USkeletalMesh* Body = nullptr;
+		if (!PrepareBodyCommand(TEXT("RCL.Spawn"), FileArgs, Job->Path, Job->Snapshot, &Body))
+		{
+			return;
+		}
+
+		USkeletalMeshComponent* BodyComponent = FindBodyComponent(World, Body);
+		if (!BodyComponent)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: no character in the play world uses '%s' or its skeleton."), *Body->GetName());
+			return;
+		}
+		if (BodyComponent->SkeletalMesh != Body)
+		{
+			// Bind against the body actually being worn, so bone names and hierarchy match it.
+			Job->Snapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*BodyComponent->SkeletalMesh);
+		}
+		const TWeakObjectPtr<USkeletalMeshComponent> WeakBody(BodyComponent);
+		const int32 MaxGPUSkinBones = FGPUBaseSkinVertexFactory::GetMaxGPUSkinBones();
+
+		Async<void>(EAsyncExecution::ThreadPool, [Job, WeakBody, MaxGPUSkinBones]()
+		{
+			const double Start = FPlatformTime::Seconds();
+			const FRCLLoadOptions Options;
+			ERCLFailureReason Reason = ERCLFailureReason::None;
+			FString Error;
+
+			TUniquePtr<IRCLMeshParser> Parser = IRCLMeshParser::CreateForFile(Job->Path);
+			if (!Parser)
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: unsupported file type: %s"), *Job->Path);
+				return;
+			}
+			if (!Parser->Parse(Job->Path, FRCLParseSettings::FromLoadOptions(Options), Job->Data, Reason, Error))
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: parse failed (%s): %s"), FailureName(Reason), *Error);
+				return;
+			}
+			if (!FRCLSkeletonBinder::Bind(Job->Data, Job->Snapshot, FRCLBindSettings::FromLoadOptions(Options), Job->Bound, Reason, Error))
+			{
+				UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: bind failed (%s): %s"), FailureName(Reason), *Error);
+				return;
+			}
+			const FRCLBuildSettings BuildSettings = FRCLBuildSettings::FromLoadOptions(Options, MaxGPUSkinBones);
+			for (int32 MeshIndex = 0; MeshIndex < Job->Data.Meshes.Num(); ++MeshIndex)
+			{
+				FRCLBuiltMesh Built;
+				if (!FRCLMeshBuilder::Build(Job->Data.Meshes[MeshIndex], Job->Bound.MeshInfluences[MeshIndex],
+					Job->Bound.MeshInfluenceStart[MeshIndex], Job->Bound.ParentIndices, BuildSettings, Built, Reason, Error))
+				{
+					UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: garment '%s' build failed (%s): %s"),
+						*Job->Data.Meshes[MeshIndex].Name, FailureName(Reason), *Error);
+					continue;
+				}
+				Job->Built.Add(MoveTemp(Built));
+			}
+			Job->WorkerMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+			if (Job->Built.Num() == 0)
+			{
+				return;
+			}
+
+			AsyncTask(ENamedThreads::GameThread, [Job, WeakBody]()
+			{
+				USkeletalMeshComponent* BodyComponent = WeakBody.Get();
+				if (!BodyComponent || !BodyComponent->SkeletalMesh || !BodyComponent->GetOwner())
+				{
+					UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: the character went away before the garment was ready (play stopped?)."));
+					return;
+				}
+
+				FRCLWriteSettings WriteSettings = FRCLWriteSettings::FromLoadOptions(FRCLLoadOptions(), BodyComponent->SkeletalMesh->Skeleton);
+				WriteSettings.bUseFullPrecisionUVs = !Job->bHalfPrecisionUVs;
+
+				for (const FRCLBuiltMesh& Built : Job->Built)
+				{
+					const double Start = FPlatformTime::Seconds();
+					ERCLFailureReason Reason = ERCLFailureReason::None;
+					FString Error;
+					USkeletalMesh* Garment = FRCLMeshWriter::Create(Built, Job->Bound, Job->Data, WriteSettings, Reason, Error);
+					if (!Garment)
+					{
+						UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Spawn: garment '%s' could not be created (%s): %s"), *Built.Name, FailureName(Reason), *Error);
+						continue;
+					}
+
+					AActor* Owner = BodyComponent->GetOwner();
+					USkeletalMeshComponent* Component = NewObject<USkeletalMeshComponent>(Owner, MakeUniqueObjectName(Owner, USkeletalMeshComponent::StaticClass(), Garment->GetFName()), RF_Transient);
+					Component->SetupAttachment(BodyComponent);
+					Component->SetSkeletalMesh(Garment);
+					Component->RegisterComponent();
+					Component->SetMasterPoseComponent(BodyComponent);   // after registering, so the bone map is built against a live component
+					SpawnedComponents.Add(Component);
+					const double WriteMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+
+					UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Spawn %s: '%s' on %s (%s), master pose; %d vertices, %d section(s), %d material slot(s), %s UVs; worker %.1f ms, game thread %.2f ms"),
+						*FPaths::GetCleanFilename(Job->Path), *Garment->GetName(), *Owner->GetName(), *BodyComponent->GetName(),
+						Built.NumVertices(), Built.Sections.Num(), Built.MaterialSlots.Num(),
+						WriteSettings.bUseFullPrecisionUVs ? TEXT("32-bit") : TEXT("16-bit"), Job->WorkerMs, WriteMs);
+				}
+			});
+		});
+	}
+
+	void Clear(const TArray<FString>& Args)
+	{
+		int32 Removed = 0;
+		for (const TWeakObjectPtr<USkeletalMeshComponent>& Weak : SpawnedComponents)
+		{
+			if (USkeletalMeshComponent* Component = Weak.Get())
+			{
+				Component->DestroyComponent();
+				++Removed;
+			}
+		}
+		SpawnedComponents.Reset();
+		UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Clear: removed %d garment(s); their meshes are freed at the next garbage collection."), Removed);
+	}
 }
 
 void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
@@ -359,6 +572,16 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		TEXT("RCL.Build"),
 		TEXT("RCL.Build <file> [/Game/path/to/BodyMesh]: parse, bind and build render data for a file, and log the result (default body: the female body)."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Build),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.Spawn"),
+		TEXT("RCL.Spawn <file> [/Game/path/to/BodyMesh] [-halfuv]: during Play-In-Editor, load a file and put it on the character wearing that body (default: the female body), following it through master pose."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Spawn),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.Clear"),
+		TEXT("RCL.Clear: remove every garment added by RCL.Spawn."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Clear),
 		ECVF_Default));
 }
 
