@@ -20,6 +20,8 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "UObject/UObjectIterator.h"
 #include "Engine/SkeletalMesh.h"
 #include "UObject/UObjectGlobals.h"
@@ -368,28 +370,53 @@ namespace RCLConsole
 		return nullptr;
 	}
 
-	/** First skeletal mesh component in World showing Body; else the first on Body's skeleton. */
+	/**
+	 * The body to dress. Only components that drive their own pose are candidates (MasterPoseComponent
+	 * unset): clothing already on a character shares the skeleton but follows the body, and 4.19 does
+	 * not chain master pose. Preference: the player's pawn over other characters (the sandbox scene
+	 * has several), then the exact body mesh over another mesh on the same skeleton.
+	 */
 	USkeletalMeshComponent* FindBodyComponent(UWorld* World, USkeletalMesh* Body)
 	{
-		USkeletalMeshComponent* SameSkeleton = nullptr;
+		const APlayerController* Player = World->GetFirstPlayerController();
+		const APawn* PlayerPawn = Player ? Player->GetPawn() : nullptr;
+
+		USkeletalMeshComponent* Best = nullptr;
+		int32 BestScore = 0;
 		for (TObjectIterator<USkeletalMeshComponent> It; It; ++It)
 		{
 			USkeletalMeshComponent* Component = *It;
 			if (Component->GetWorld() != World || !Component->SkeletalMesh || Component->IsPendingKill()
+				|| Component->MasterPoseComponent.IsValid()
 				|| SpawnedComponents.Contains(TWeakObjectPtr<USkeletalMeshComponent>(Component)))
 			{
 				continue;
 			}
+
+			int32 Score = 0;
 			if (Component->SkeletalMesh == Body)
 			{
-				return Component;
+				Score = 2;
 			}
-			if (!SameSkeleton && Component->SkeletalMesh->Skeleton == Body->Skeleton)
+			else if (Component->SkeletalMesh->Skeleton == Body->Skeleton)
 			{
-				SameSkeleton = Component;
+				Score = 1;
+			}
+			if (Score == 0)
+			{
+				continue;
+			}
+			if (PlayerPawn && Component->GetOwner() == PlayerPawn)
+			{
+				Score += 4;
+			}
+			if (Score > BestScore)
+			{
+				Best = Component;
+				BestScore = Score;
 			}
 		}
-		return SameSkeleton;
+		return Best;
 	}
 
 	/** Worker output handed to the game thread. */
