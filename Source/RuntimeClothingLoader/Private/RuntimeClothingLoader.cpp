@@ -34,7 +34,7 @@
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.8.0")
+#define RCL_PLUGIN_VERSION TEXT("0.8.1")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -528,7 +528,21 @@ namespace RCLConsole
 		// -actor=Name picks the character whose actor name contains Name (see RCL.ListBodies).
 		FString ActorFilter;
 		bool bHalfPrecisionUVs = false;
-		const TArray<FString> FileArgs = TakeSwitches(Args, ActorFilter, bHalfPrecisionUVs);
+		// -bodyweights: take the weights from the body (follows its jiggle and extra bones) instead of the file's.
+		bool bBodyWeights = false;
+		TArray<FString> Remaining;
+		for (const FString& Arg : Args)
+		{
+			if (Arg.Equals(TEXT("-bodyweights"), ESearchCase::IgnoreCase))
+			{
+				bBodyWeights = true;
+			}
+			else
+			{
+				Remaining.Add(Arg);
+			}
+		}
+		const TArray<FString> FileArgs = TakeSwitches(Remaining, ActorFilter, bHalfPrecisionUVs);
 
 		UWorld* World = FindPlayWorld();
 		if (!World)
@@ -560,6 +574,10 @@ namespace RCLConsole
 		FRCLLoadOptions Options;
 		Options.BodyMesh = BodyComponent->SkeletalMesh;   // the body actually worn
 		Options.bUseFullPrecisionUVs = !bHalfPrecisionUVs;
+		if (bBodyWeights)
+		{
+			Options.SkinningMode = ERCLSkinningMode::TransferAlways;
+		}
 		const TWeakObjectPtr<USkeletalMeshComponent> WeakBody(BodyComponent);
 
 		FRCLLoadPipeline::Get().RequestLoad(World, Path, Options, FRCLLoadDone::CreateLambda(
@@ -729,7 +747,7 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(
 		TEXT("RCL.Spawn"),
-		TEXT("RCL.Spawn <file> [/Game/path/to/BodyMesh] [-actor=Name] [-halfuv]: during Play-In-Editor, load a file and put it on the on-screen character wearing that body (default: the female body), following it through master pose."),
+		TEXT("RCL.Spawn <file> [/Game/path/to/BodyMesh] [-actor=Name] [-halfuv] [-bodyweights]: during Play-In-Editor, load a file and put it on the on-screen character wearing that body (default: the female body), following it through master pose."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Spawn),
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(
