@@ -8,6 +8,8 @@
 #include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/Material.h"
+#include "RCLBodySnapshot.h"
 #include "Misc/Paths.h"
 
 USkeletalMeshComponent* URCLClothingLibrary::PutClothingOnCharacter(USkeletalMeshComponent* Body, USkeletalMesh* Clothing,
@@ -85,10 +87,38 @@ int32 URCLClothingLibrary::SetClothingMaterials(USkeletalMeshComponent* Clothing
 				*ClothingComponent->SkeletalMesh->GetName(), *Pair.Key.ToString());
 			continue;
 		}
+		// A material without "Used with Skeletal Mesh" draws as the default material in packaged builds
+		// (the editor quietly compiles it on the fly, which hides the problem until Shipping).
+		const UMaterial* Base = Pair.Value ? Pair.Value->GetMaterial() : nullptr;
+		if (Base && !Base->bUsedWithSkeletalMesh)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("Set Clothing Materials: '%s' does not have 'Used with Skeletal Mesh' ticked; it will show as the default material in packaged builds."),
+				*Pair.Value->GetPathName());
+		}
 		ClothingComponent->SetMaterial(Slot, Pair.Value);   // per component: the shared mesh is untouched
 		++NumSet;
 	}
 	return NumSet;
+}
+
+bool URCLClothingLibrary::PrepareBodyForClothing(USkeletalMesh* BodyMesh, const TArray<USkeletalMesh*>& AttachmentMeshes)
+{
+	if (!BodyMesh)
+	{
+		UE_LOG(LogRuntimeClothing, Warning, TEXT("Prepare Body For Clothing: no body mesh given."));
+		return false;
+	}
+	TArray<USkeletalMesh*> Attachments;
+	for (USkeletalMesh* Attachment : AttachmentMeshes)
+	{
+		if (Attachment)
+		{
+			Attachments.Add(Attachment);
+		}
+	}
+	// Same cache entry Load Clothing uses with its default options (morph transfer on).
+	FString Error;
+	return FRCLBodySnapshotCache::Get().FindOrCapture(*BodyMesh, Attachments, /*bWithMorphs*/ true, Error).IsValid();
 }
 
 bool URCLClothingLibrary::IsSupportedClothingFile(const FString& FilePath)

@@ -3,6 +3,7 @@
 
 #include "RuntimeClothingLoader.h"
 #include "RCLLoadPipeline.h"        // all builds: world cleanup and shutdown
+#include "RCLBodySnapshot.h"
 #include "Engine/World.h"          // FWorldDelegates
 
 #if !UE_BUILD_SHIPPING
@@ -20,6 +21,7 @@
 #include "RCLLoadPipeline.h"
 #include "RCLClothingLibrary.h"
 #include "Materials/MaterialInterface.h"
+#include "Animation/MorphTarget.h"
 #include "Animation/Skeleton.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/Engine.h"
@@ -32,7 +34,7 @@
 #include "UObject/UObjectGlobals.h"
 #endif
 
-#define RCL_PLUGIN_VERSION TEXT("0.7.0")
+#define RCL_PLUGIN_VERSION TEXT("0.8.0")
 
 DEFINE_LOG_CATEGORY(LogRuntimeClothing);
 
@@ -164,6 +166,10 @@ namespace RCLConsole
 			for (const FString& Warning : Data.Warnings)
 			{
 				UE_LOG(LogRuntimeClothing, Log, TEXT("  Warning: %s"), *Warning);
+			}
+			for (const FString& Notice : Data.TechnicalWarnings)
+			{
+				UE_LOG(LogRuntimeClothing, Log, TEXT("  Reader notice: %s"), *Notice);
 			}
 		});
 	}
@@ -581,9 +587,10 @@ namespace RCLConsole
 					continue;
 				}
 				SpawnedComponents.Add(Component);
-				UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Spawn %s: '%s' on %s (%s), master pose; %d section(s), %d material slot(s); worker %.1f ms, game thread %.2f ms"),
+				UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Spawn %s: '%s' on %s (%s), master pose; %d vertices, %d section(s), %d material slot(s), %d morph target(s), fit %.0f%%%s; worker %.1f ms, game thread %.2f ms"),
 					*FPaths::GetCleanFilename(Path), *Garment->GetName(), *BodyComponent->GetOwner()->GetName(), *BodyComponent->GetName(),
-					Report.NumSections, Garment->Materials.Num(), Report.WorkerTimeMs, Report.GameThreadTimeMs);
+					Report.NumVertices, Report.NumSections, Garment->Materials.Num(), Garment->MorphTargets.Num(), Report.TransferMatchRatio * 100.0f,
+					Report.bUsedWeightTransfer ? TEXT(", weights from the body") : TEXT(""), Report.WorkerTimeMs, Report.GameThreadTimeMs);
 			}
 			for (const FString& Warning : Report.Warnings)
 			{
@@ -648,6 +655,39 @@ namespace RCLConsole
 		UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Variant: set %d slot(s) on '%s'."), NumSet, *Component->GetName());
 	}
 
+	/** RCL.Morph [name value]: sets a morph on the BODY the last garment follows, so the garment's copy of
+	 *  that morph can be seen following it. With no arguments, lists the garment's morph targets. */
+	void Morph(const TArray<FString>& Args)
+	{
+		USkeletalMeshComponent* Garment = nullptr;
+		for (int32 Index = SpawnedComponents.Num() - 1; Index >= 0 && !Garment; --Index)
+		{
+			Garment = SpawnedComponents[Index].Get();
+		}
+		USkeletalMeshComponent* Body = Garment ? Cast<USkeletalMeshComponent>(Garment->MasterPoseComponent.Get()) : nullptr;
+		if (!Garment || !Body || !Garment->SkeletalMesh)
+		{
+			UE_LOG(LogRuntimeClothing, Warning, TEXT("RCL.Morph: spawn a garment with RCL.Spawn first."));
+			return;
+		}
+		if (Args.Num() < 2)
+		{
+			const TArray<UMorphTarget*>& Morphs = Garment->SkeletalMesh->MorphTargets;
+			UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Morph: '%s' has %d morph target(s). Usage: RCL.Morph <name> <value 0..1>"), *Garment->SkeletalMesh->GetName(), Morphs.Num());
+			for (int32 Index = 0; Index < Morphs.Num(); ++Index)
+			{
+				if (Morphs[Index])
+				{
+					UE_LOG(LogRuntimeClothing, Log, TEXT("  %s"), *Morphs[Index]->GetName());
+				}
+			}
+			return;
+		}
+		const float Value = FCString::Atof(*Args[1]);
+		Body->SetMorphTarget(FName(*Args[0]), Value);
+		UE_LOG(LogRuntimeClothing, Log, TEXT("RCL.Morph: body morph '%s' = %.2f on %s (the garment follows through master pose)."), *Args[0], Value, *Body->GetName());
+	}
+
 	void Clear(const TArray<FString>& Args)
 	{
 		int32 Removed = 0;
@@ -708,6 +748,11 @@ void FRuntimeClothingLoaderModule::RegisterConsoleCommands()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Variant),
 		ECVF_Default));
 	ConsoleCommands.Add(Console.RegisterConsoleCommand(
+		TEXT("RCL.Morph"),
+		TEXT("RCL.Morph [name value]: set a body morph to see the last RCL.Spawn garment follow it; no arguments lists the garment's morphs."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Morph),
+		ECVF_Default));
+	ConsoleCommands.Add(Console.RegisterConsoleCommand(
 		TEXT("RCL.Clear"),
 		TEXT("RCL.Clear: remove every garment added by RCL.Spawn."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RCLConsole::Clear),
@@ -746,6 +791,7 @@ void FRuntimeClothingLoaderModule::ShutdownModule()
 {
 	FWorldDelegates::OnWorldCleanup.Remove(WorldCleanupHandle);
 	FRCLLoadPipeline::Get().Shutdown();
+	FRCLBodySnapshotCache::Get().Reset();
 
 #if !UE_BUILD_SHIPPING
 	UnregisterConsoleCommands();

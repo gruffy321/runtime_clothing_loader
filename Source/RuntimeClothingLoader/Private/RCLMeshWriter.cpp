@@ -5,6 +5,7 @@
 #include "RuntimeClothingLoader.h"
 #include "Engine/SkeletalMesh.h"
 #include "Animation/Skeleton.h"
+#include "Animation/MorphTarget.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
 #include "ReferenceSkeleton.h"
@@ -269,6 +270,35 @@ void FRCLMeshWriter::FillIndexBufferAndBones(FSkeletalMeshLODRenderData& LOD, co
 	LOD.RequiredBones = Built.RequiredBones;
 }
 
+void FRCLMeshWriter::CreateMorphTargets(USkeletalMesh& Mesh, const FRCLBuiltMesh& Built)
+{
+	if (Built.Morphs.Num() == 0)
+	{
+		return;
+	}
+	for (const FRCLBuiltMorph& Source : Built.Morphs)
+	{
+		// Named exactly as the body's morph: master pose hands the body's value to it by name.
+		UMorphTarget* Morph = NewObject<UMorphTarget>(&Mesh, Source.Name);
+		Morph->BaseSkelMesh = &Mesh;
+		FMorphTargetLODModel& Model = Morph->MorphLODModels[Morph->MorphLODModels.AddDefaulted()];
+		Model.NumBaseMeshVerts = Built.NumVertices();
+		Model.SectionIndices = Source.SectionIndices;
+		Model.Vertices.SetNumUninitialized(Source.RenderVertex.Num());
+		for (int32 K = 0; K < Source.RenderVertex.Num(); ++K)
+		{
+			FMorphTargetDelta& Delta = Model.Vertices[K];
+			Delta.PositionDelta = Source.PositionDelta[K];
+			Delta.TangentZDelta = Source.TangentZDelta[K];
+			Delta.SourceIdx = Source.RenderVertex[K];
+		}
+		Mesh.MorphTargets.Add(Morph);
+	}
+	// Builds the name -> index map (and registers the names as curves on the skeleton, which already
+	// has them from the body). Must run before InitResources, which builds the GPU morph buffers.
+	Mesh.InitMorphTargets();
+}
+
 void FRCLMeshWriter::FinaliseAndInit(USkeletalMesh& Mesh, FSkeletalMeshLODRenderData* LOD, const FRCLBuiltMesh& Built)
 {
 	Mesh.AllocateResourceForRendering();
@@ -325,6 +355,7 @@ USkeletalMesh* FRCLMeshWriter::Create(const FRCLBuiltMesh& Built, const FRCLBind
 	FillSkinWeights(*LOD, Built, Settings);
 	FillIndexBufferAndBones(*LOD, Built);
 
+	CreateMorphTargets(*Mesh, Built);
 	FinaliseAndInit(*Mesh, LOD, Built);
 	return Mesh;
 }

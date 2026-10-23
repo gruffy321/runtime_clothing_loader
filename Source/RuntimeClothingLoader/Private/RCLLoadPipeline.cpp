@@ -9,6 +9,8 @@
 #include "RCLSkeletonBinder.h"
 #include "RCLMeshBuilder.h"
 #include "RCLMeshWriter.h"
+#include "RCLBodySnapshot.h"
+#include "RCLTransfer.h"
 #include "Async/Async.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
@@ -101,8 +103,34 @@ struct FRCLLoadPipeline::FJob
 	FRCLBindResult Bound;
 	TArray<FRCLBuiltMesh> Built;
 	TArray<FRCLMeshNodeInfo> Parts;   // checks only
+
+	// Milestone 8: shared body copy for weight and morph transfer (null for rigid items, or if it
+	// could not be taken: BodyError says why, and only garments that need weights then fail).
+	TSharedPtr<const FRCLBodySnapshot, ESPMode::ThreadSafe> Body;
+	FString BodyError;
 	FRCLLoadReport Report;
 };
+
+namespace RCLPipeline
+{
+	/** Game thread: the shared body snapshot when this load may transfer weights or morphs. */
+	void FetchBody(const FRCLLoadOptions& Options, TSharedPtr<const FRCLBodySnapshot, ESPMode::ThreadSafe>& OutBody, FString& OutError)
+	{
+		if (Options.SkinningMode == ERCLSkinningMode::RigidToBone || !Options.BodyMesh)
+		{
+			return;   // rigid items: no weight transfer and no morphs (TD decision)
+		}
+		TArray<USkeletalMesh*> Attachments;
+		for (USkeletalMesh* Attachment : Options.BodyAttachmentMeshes)
+		{
+			if (Attachment)
+			{
+				Attachments.Add(Attachment);
+			}
+		}
+		OutBody = FRCLBodySnapshotCache::Get().FindOrCapture(*Options.BodyMesh, Attachments, Options.bTransferMorphTargets, OutError);
+	}
+}
 
 // ---- Public -------------------------------------------------------------------------------------
 
@@ -144,9 +172,14 @@ uint32 FRCLLoadPipeline::RequestLoad(UWorld* World, const FString& FilePath, con
 	}
 
 	TArray<USkeletalMesh*> Cached;
-	if (FindCached(Key, Cached))
+	FRCLLoadReport CachedReport;
+	if (FindCached(Key, Cached, CachedReport))
 	{
 		UE_LOG(LogRuntimeClothing, Log, TEXT("Load Clothing: '%s' served from the cache (%d mesh(es))."), *FPaths::GetCleanFilename(FilePath), Cached.Num());
+		// Milestone 8: the counts of the build that made it; no new work was done this time.
+		Report = CachedReport;
+		Report.WorkerTimeMs = 0.0f;
+		Report.GameThreadTimeMs = 0.0f;
 		Report.Warnings.Add(TEXT("Reused an already loaded copy of this item."));
 		TArray<TWeakObjectPtr<USkeletalMesh>> Weak;
 		for (USkeletalMesh* Mesh : Cached)
@@ -173,6 +206,7 @@ uint32 FRCLLoadPipeline::RequestLoad(UWorld* World, const FString& FilePath, con
 	Job->Snapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*Options.BodyMesh);
 	Job->MaxGPUSkinBones = FGPUBaseSkinVertexFactory::GetMaxGPUSkinBones();
 	Job->Report.SourceFile = FilePath;
+	RCLPipeline::FetchBody(Options, Job->Body, Job->BodyError);
 	InFlightLoads.Add(Key, Job);
 	Enqueue(Job);
 	return Id;
@@ -211,6 +245,7 @@ uint32 FRCLLoadPipeline::RequestCheck(UWorld* World, const FString& FilePath, co
 	Job->Snapshot = FRCLSkeletonSnapshot::FromSkeletalMesh(*Options.BodyMesh);
 	Job->MaxGPUSkinBones = FGPUBaseSkinVertexFactory::GetMaxGPUSkinBones();
 	Job->Report.SourceFile = FilePath;
+	RCLPipeline::FetchBody(Options, Job->Body, Job->BodyError);
 	Enqueue(Job);
 	return Id;
 }
@@ -314,14 +349,15 @@ bool FRCLLoadPipeline::ValidateRequest(const FString& FilePath, const FRCLLoadOp
 	return true;
 }
 
-bool FRCLLoadPipeline::FindCached(const FRCLCacheKey& Key, TArray<USkeletalMesh*>& OutMeshes)
+bool FRCLLoadPipeline::FindCached(const FRCLCacheKey& Key, TArray<USkeletalMesh*>& OutMeshes, FRCLLoadReport& OutReport)
 {
-	TArray<TWeakObjectPtr<USkeletalMesh>>* Entry = Cache.Find(Key);
+	FCacheEntry* Entry = Cache.Find(Key);
 	if (!Entry)
 	{
 		return false;
 	}
-	for (const TWeakObjectPtr<USkeletalMesh>& Weak : *Entry)
+	OutReport = Entry->Report;
+	for (const TWeakObjectPtr<USkeletalMesh>& Weak : Entry->Meshes)
 	{
 		USkeletalMesh* Mesh = Weak.Get();
 		if (!Mesh || Mesh->IsPendingKill())
@@ -395,6 +431,10 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 		return;
 	}
 	Report.Warnings.Append(Job.Data.Warnings);
+	for (const FString& Notice : Job.Data.TechnicalWarnings)
+	{
+		UE_LOG(LogRuntimeClothing, Log, TEXT("'%s' (reader notice): %s"), *FPaths::GetCleanFilename(Job.FilePath), *Notice);
+	}
 	for (const FRCLImportMesh& Mesh : Job.Data.Meshes)
 	{
 		Report.MeshNodes.Append(Mesh.SourceNodes);
@@ -409,6 +449,56 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 	Report.UnknownBones = Job.Bound.UnknownBones;
 	Report.Warnings.Append(Job.Bound.Warnings);
 
+	// ---- Milestone 8: transfer from the body -------------------------------------------------
+	// Weights: TransferAlways, or Auto when a garment has none or most of the file's weight sits on
+	// bones the character lacks (TD decision). Morphs: always, unless rigid or turned off.
+	const FRCLTransferSettings TransferSettings = FRCLTransferSettings::FromLoadOptions(Job.Options);
+	const FRCLBodySnapshot* Body = Job.Body.Get();
+	const bool bMorphs = Body && Job.Options.bTransferMorphTargets && Job.Options.SkinningMode != ERCLSkinningMode::RigidToBone;
+	TArray<TArray<FRCLVertexMatch>> Matches;
+	Matches.SetNum(Job.Data.Meshes.Num());
+	FRCLTransferStats TransferStats;
+	float WorstMatchRatio = 1.0f;
+	bool bAnyMatched = false;
+
+	for (int32 MeshIndex = 0; MeshIndex < Job.Data.Meshes.Num(); ++MeshIndex)
+	{
+		const bool bNeedWeights = Job.Options.SkinningMode == ERCLSkinningMode::TransferAlways
+			|| (Job.Options.SkinningMode == ERCLSkinningMode::Auto
+				&& (Job.Bound.MeshInfluences[MeshIndex].Num() == 0 || Job.Bound.bTransferRecommended));
+		if ((!bNeedWeights && !bMorphs) || !Body)
+		{
+			continue;
+		}
+		FRCLTransfer::MatchVertices(Job.Data.Meshes[MeshIndex], *Body, TransferSettings, Matches[MeshIndex], TransferStats);
+		WorstMatchRatio = FMath::Min(WorstMatchRatio, TransferStats.MatchRatio);
+		Report.TransferMaxDistanceCm = FMath::Max(Report.TransferMaxDistanceCm, TransferStats.MaxDistanceCm);
+		bAnyMatched = true;
+
+		if (bNeedWeights)
+		{
+			TArray<FRCLInfluence> TargetInfluences;
+			TArray<uint32> TargetStart;
+			FRCLTransfer::TransferWeights(Matches[MeshIndex], *Body, TargetInfluences, TargetStart);
+			FRCLSkeletonBinder::AddTargetInfluences(MeshIndex, TargetInfluences, TargetStart, Job.Snapshot, Job.Bound);
+			Report.bUsedWeightTransfer = true;
+		}
+	}
+	if (bAnyMatched)
+	{
+		Report.TransferMatchRatio = WorstMatchRatio;
+		if (WorstMatchRatio < 0.9f)
+		{
+			Report.Warnings.Add(FString::Printf(TEXT("Only %.0f%% of the clothing sits close to the body; loose areas may not follow body shape changes exactly."),
+				WorstMatchRatio * 100.0f));
+		}
+	}
+	if (!Body && !Job.BodyError.IsEmpty() && Job.Options.SkinningMode != ERCLSkinningMode::RigidToBone)
+	{
+		Report.Warnings.Add(TEXT("The clothing will not follow body shape sliders: the body could not be read for fitting."));
+		UE_LOG(LogRuntimeClothing, Warning, TEXT("'%s': no body snapshot (%s)."), *FPaths::GetCleanFilename(Job.FilePath), *Job.BodyError);
+	}
+
 	const FRCLBuildSettings BuildSettings = FRCLBuildSettings::FromLoadOptions(Job.Options, Job.MaxGPUSkinBones);
 	TArray<FString> FailedParts;
 	FString FirstError;
@@ -418,7 +508,7 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 		const FRCLImportMesh& Mesh = Job.Data.Meshes[MeshIndex];
 		if (Job.Bound.MeshInfluences[MeshIndex].Num() == 0)
 		{
-			// Unweighted garment in Auto mode: needs weight transfer (Milestone 8) or a rigid bone.
+			// Still unweighted: no body to transfer from.
 			FailedParts.Add(Mesh.Name);
 			if (FirstReason == ERCLFailureReason::None)
 			{
@@ -444,6 +534,14 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 		Report.NumTriangles += Built.Stats.NumTriangles;
 		Report.NumSections += Built.Sections.Num();
 		Report.Warnings.Append(Built.Warnings);
+
+		if (bMorphs && Matches[MeshIndex].Num() == Mesh.NumVertices())
+		{
+			TArray<FRCLMorphDeltas> SourceMorphs;
+			FRCLTransfer::TransferMorphs(Matches[MeshIndex], *Body, TransferSettings, SourceMorphs, TransferStats);
+			FRCLMeshBuilder::BuildMorphs(SourceMorphs, Built);
+			Report.NumMorphTargets += Built.Morphs.Num();
+		}
 		Job.Built.Add(MoveTemp(Built));
 	}
 
@@ -460,6 +558,13 @@ void FRCLLoadPipeline::RunWorker(FJob& Job)
 		Report.Warnings.Add(FString::Printf(TEXT("Part '%s' was skipped: it could not be built."), *Part));
 	}
 
+	if (bAnyMatched)
+	{
+		UE_LOG(LogRuntimeClothing, Log, TEXT("'%s': fitted to %s; %.0f%% good match, furthest %.1f cm, %d morph(s) transferred, %d not affecting it, %s; %.1f ms."),
+			*FPaths::GetCleanFilename(Job.FilePath), *Body->SourceName, Report.TransferMatchRatio * 100.0f, Report.TransferMaxDistanceCm,
+			TransferStats.NumMorphsTransferred, TransferStats.NumMorphsSkipped, Report.bUsedWeightTransfer ? TEXT("weights from the body") : TEXT("file weights"),
+			TransferStats.TimeMs);
+	}
 	Report.WorkerTimeMs = (float)((FPlatformTime::Seconds() - Start) * 1000.0);
 	Job.bWorkerSucceeded = true;
 }
@@ -518,12 +623,13 @@ void FRCLLoadPipeline::CompleteOnGameThread(const TSharedRef<FJob, ESPMode::Thre
 
 	if (bSucceeded)
 	{
-		TArray<TWeakObjectPtr<USkeletalMesh>>& Entry = Cache.FindOrAdd(Job->Key);
-		Entry.Reset();
+		FCacheEntry& Entry = Cache.FindOrAdd(Job->Key);
+		Entry.Meshes.Reset();
 		for (USkeletalMesh* Mesh : Meshes)
 		{
-			Entry.Add(Mesh);
+			Entry.Meshes.Add(Mesh);
 		}
+		Entry.Report = Report;
 		UE_LOG(LogRuntimeClothing, Log, TEXT("Load Clothing: '%s' built %d mesh(es), %d vertices; worker %.1f ms, game thread %.2f ms."),
 			*FPaths::GetCleanFilename(Job->FilePath), Meshes.Num(), Report.NumVertices, Report.WorkerTimeMs, Report.GameThreadTimeMs);
 	}

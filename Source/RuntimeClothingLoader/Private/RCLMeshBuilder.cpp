@@ -29,6 +29,12 @@ SIZE_T FRCLBuiltMesh::GetAllocatedSize() const
 	{
 		Size += Section.BoneMap.GetAllocatedSize();
 	}
+	Size += Morphs.GetAllocatedSize();
+	for (const FRCLBuiltMorph& Morph : Morphs)
+	{
+		Size += Morph.RenderVertex.GetAllocatedSize() + Morph.PositionDelta.GetAllocatedSize()
+			+ Morph.TangentZDelta.GetAllocatedSize() + Morph.SectionIndices.GetAllocatedSize();
+	}
 	return Size;
 }
 
@@ -698,4 +704,87 @@ bool FRCLMeshBuilder::Build(const FRCLImportMesh& Mesh, const TArray<FRCLInfluen
 
 	OutMesh.Stats.BuildTimeMs = (FPlatformTime::Seconds() - Start) * 1000.0;
 	return true;
+}
+
+void FRCLMeshBuilder::BuildMorphs(const TArray<FRCLMorphDeltas>& SourceMorphs, FRCLBuiltMesh& InOutMesh)
+{
+	InOutMesh.Morphs.Reset();
+	if (SourceMorphs.Num() == 0 || InOutMesh.NumVertices() == 0)
+	{
+		return;
+	}
+
+	// Source vertex -> its render copies (the builder duplicates vertices at section boundaries),
+	// and render vertex -> section.
+	int32 NumSource = 0;
+	for (int32 Source : InOutMesh.SourceVertex)
+	{
+		NumSource = FMath::Max(NumSource, Source + 1);
+	}
+	TArray<int32> CopyStart, Copies;
+	CopyStart.SetNumZeroed(NumSource + 1);
+	for (int32 Source : InOutMesh.SourceVertex)
+	{
+		++CopyStart[Source + 1];
+	}
+	for (int32 S = 0; S < NumSource; ++S)
+	{
+		CopyStart[S + 1] += CopyStart[S];
+	}
+	Copies.SetNumUninitialized(InOutMesh.NumVertices());
+	{
+		TArray<int32> Fill = CopyStart;
+		for (int32 Render = 0; Render < InOutMesh.NumVertices(); ++Render)
+		{
+			Copies[Fill[InOutMesh.SourceVertex[Render]]++] = Render;
+		}
+	}
+	TArray<int32> SectionOfRender;
+	SectionOfRender.Init(0, InOutMesh.NumVertices());
+	for (int32 S = 0; S < InOutMesh.Sections.Num(); ++S)
+	{
+		const FRCLBuiltSection& Section = InOutMesh.Sections[S];
+		for (uint32 R = Section.BaseVertexIndex; R < Section.BaseVertexIndex + Section.NumVertices; ++R)
+		{
+			SectionOfRender[R] = S;
+		}
+	}
+
+	struct FEntry { uint32 Render; FVector Position; FVector Normal; };
+	TArray<FEntry> Entries;
+	for (const FRCLMorphDeltas& Source : SourceMorphs)
+	{
+		Entries.Reset();
+		for (int32 K = 0; K < Source.SourceVertex.Num(); ++K)
+		{
+			const int32 SourceVertex = Source.SourceVertex[K];
+			if (SourceVertex < 0 || SourceVertex >= NumSource)
+			{
+				continue;   // a source vertex with no render copy (not referenced by any triangle)
+			}
+			for (int32 C = CopyStart[SourceVertex]; C < CopyStart[SourceVertex + 1]; ++C)
+			{
+				Entries.Add({ (uint32)Copies[C], Source.PositionDelta[K], Source.NormalDelta[K] });
+			}
+		}
+		if (Entries.Num() == 0)
+		{
+			continue;
+		}
+		Entries.Sort([](const FEntry& A, const FEntry& B) { return A.Render < B.Render; });
+
+		FRCLBuiltMorph& Morph = InOutMesh.Morphs[InOutMesh.Morphs.AddDefaulted()];
+		Morph.Name = Source.Name;
+		Morph.RenderVertex.Reserve(Entries.Num());
+		Morph.PositionDelta.Reserve(Entries.Num());
+		Morph.TangentZDelta.Reserve(Entries.Num());
+		for (const FEntry& Entry : Entries)
+		{
+			Morph.RenderVertex.Add(Entry.Render);
+			Morph.PositionDelta.Add(Entry.Position);
+			Morph.TangentZDelta.Add(Entry.Normal);
+			Morph.SectionIndices.AddUnique(SectionOfRender[Entry.Render]);
+		}
+		Morph.SectionIndices.Sort();
+	}
 }

@@ -829,7 +829,8 @@ bool FRCLFbxParser::Parse(const FString& FilePath, const FRCLParseSettings& Sett
 		for (const FString& Text : Unique)
 		{
 			const int32 Count = Counts.FindChecked(Text);
-			Data.Warnings.Add(Count > 1 ? FString::Printf(TEXT("%s (x%d)"), *Text, Count) : Text);
+			// Milestone 8: the reader's own notices are for the log, not for players.
+			Data.TechnicalWarnings.Add(Count > 1 ? FString::Printf(TEXT("%s (x%d)"), *Text, Count) : Text);
 		}
 	}
 

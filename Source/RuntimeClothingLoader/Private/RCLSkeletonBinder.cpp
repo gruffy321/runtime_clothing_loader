@@ -377,3 +377,95 @@ bool FRCLSkeletonBinder::Bind(const FRCLImportData& Data, const FRCLSkeletonSnap
 		OutResult.UnknownBones.Num(), OutResult.MaxBindOffsetCm);
 	return true;
 }
+
+void FRCLSkeletonBinder::AddTargetInfluences(int32 MeshIndex, const TArray<FRCLInfluence>& TargetInfluences,
+	const TArray<uint32>& TargetInfluenceStart, const FRCLSkeletonSnapshot& Target, FRCLBindResult& InOutResult)
+{
+	check(InOutResult.MeshInfluences.IsValidIndex(MeshIndex));
+
+	// Needed target bones: the garment's current bones, the transferred ones, and all ancestors.
+	TArray<bool> bNeeded;
+	bNeeded.SetNumZeroed(Target.NumBones());
+	bNeeded[0] = true;
+	auto Need = [&bNeeded, &Target](int32 Bone)
+	{
+		for (int32 Current = Bone; Current != INDEX_NONE && !bNeeded[Current]; Current = Target.ParentIndices[Current])
+		{
+			bNeeded[Current] = true;
+		}
+	};
+	for (int32 TargetBone : InOutResult.TargetBoneIndices)
+	{
+		Need(TargetBone);
+	}
+	for (const FRCLInfluence& Influence : TargetInfluences)
+	{
+		if (Influence.JointIndex >= 0 && Influence.JointIndex < Target.NumBones())
+		{
+			Need(Influence.JointIndex);
+		}
+	}
+
+	// Existing garment bones keep their pose (the file's bind pose where the file had the bone).
+	TMap<int32, int32> OldGarmentOfTarget;
+	for (int32 Garment = 0; Garment < InOutResult.TargetBoneIndices.Num(); ++Garment)
+	{
+		OldGarmentOfTarget.Add(InOutResult.TargetBoneIndices[Garment], Garment);
+	}
+
+	FRCLBindResult Rebuilt;
+	TMap<int32, int32> NewGarmentOfTarget;
+	for (int32 Bone = 0; Bone < Target.NumBones(); ++Bone)
+	{
+		if (!bNeeded[Bone])
+		{
+			continue;
+		}
+		const int32 TargetParent = Target.ParentIndices[Bone];
+		const int32* GarmentParent = (TargetParent != INDEX_NONE) ? NewGarmentOfTarget.Find(TargetParent) : nullptr;
+		const int32* Old = OldGarmentOfTarget.Find(Bone);
+		const FTransform Component = Old ? InOutResult.RefPoseComponent[*Old] : Target.RefPoseComponent[Bone];
+
+		const int32 GarmentIndex = Rebuilt.BoneNames.Add(Target.BoneNames[Bone]);
+		Rebuilt.ParentIndices.Add(GarmentParent ? *GarmentParent : INDEX_NONE);
+		Rebuilt.TargetBoneIndices.Add(Bone);
+		Rebuilt.RefPoseComponent.Add(Component);
+		Rebuilt.RefPoseLocal.Add(GarmentParent ? Component.GetRelativeTransform(Rebuilt.RefPoseComponent[*GarmentParent]) : Component);
+		NewGarmentOfTarget.Add(Bone, GarmentIndex);
+	}
+
+	// Old garment index -> new garment index, for every other garment's existing influences.
+	TArray<int32> NewOfOld;
+	NewOfOld.SetNumUninitialized(InOutResult.TargetBoneIndices.Num());
+	for (int32 Garment = 0; Garment < InOutResult.TargetBoneIndices.Num(); ++Garment)
+	{
+		NewOfOld[Garment] = NewGarmentOfTarget.FindChecked(InOutResult.TargetBoneIndices[Garment]);
+	}
+	for (int32 Mesh = 0; Mesh < InOutResult.MeshInfluences.Num(); ++Mesh)
+	{
+		if (Mesh == MeshIndex)
+		{
+			continue;
+		}
+		for (FRCLInfluence& Influence : InOutResult.MeshInfluences[Mesh])
+		{
+			Influence.JointIndex = NewOfOld[Influence.JointIndex];
+		}
+	}
+
+	// This garment's influences: transferred, target -> new garment index.
+	TArray<FRCLInfluence>& Out = InOutResult.MeshInfluences[MeshIndex];
+	Out = TargetInfluences;
+	for (FRCLInfluence& Influence : Out)
+	{
+		const int32* Garment = NewGarmentOfTarget.Find(Influence.JointIndex);
+		Influence.JointIndex = Garment ? *Garment : 0;
+	}
+	InOutResult.MeshInfluenceStart[MeshIndex] = TargetInfluenceStart;
+
+	InOutResult.BoneNames = MoveTemp(Rebuilt.BoneNames);
+	InOutResult.ParentIndices = MoveTemp(Rebuilt.ParentIndices);
+	InOutResult.TargetBoneIndices = MoveTemp(Rebuilt.TargetBoneIndices);
+	InOutResult.RefPoseComponent = MoveTemp(Rebuilt.RefPoseComponent);
+	InOutResult.RefPoseLocal = MoveTemp(Rebuilt.RefPoseLocal);
+}

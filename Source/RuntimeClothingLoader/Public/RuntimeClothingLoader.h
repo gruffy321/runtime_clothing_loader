@@ -62,6 +62,9 @@ private:
 	 *   RCL.Check <file> [body mesh path]  (Milestone 7) runs Check Clothing File and logs the result.
 	 *   RCL.Variant <slot name> <material path>  sets one material slot on the last RCL.Spawn garment
 	 *                       through Set Clothing Materials.
+	 *   RCL.Morph [name value]  (Milestone 8) sets a morph on the body the last RCL.Spawn garment
+	 *                       follows, to see the garment's transferred copy follow it; no arguments
+	 *                       lists the garment's morph targets.
 	 * Since Milestone 7, RCL.Spawn goes through the same pipeline as the Load Clothing node, so running
 	 * it twice shows the shared cache at work.
 	 * Not compiled into Shipping builds.
